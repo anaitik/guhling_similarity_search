@@ -143,7 +143,12 @@ def main():
                 st.error(f"Failed to load uploaded mesh: {exc}")
                 return
 
-    top_k = st.slider("Top K results", min_value=1, max_value=30, value=10)
+    top_k = None
+    if query_mode == "Upload STL":
+        top_k = 5
+        st.info("Upload mode returns the top 5 most similar results.")
+    else:
+        top_k = st.slider("Top K results", min_value=1, max_value=30, value=10)
     run = st.button("Search")
 
     if run:
