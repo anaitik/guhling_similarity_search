@@ -87,14 +87,26 @@ def main():
     )
     st.title("3D Mesh Similarity Search")
     st.caption(f"Data directory: {DATA_DIR}")
+    with st.expander("Quick start", expanded=True):
+        st.markdown(
+            """
+            1. Put your `.stl` files inside the `data/` folder at the project root.
+            2. Choose an embedding backend in the sidebar.
+            3. Build the index once, then run searches.
+            """
+        )
 
     backend = _make_backend()
     mesh_paths, rel_paths = _load_mesh_list()
 
     if not mesh_paths:
-        st.error("No .stl files found in the data directory.")
+        st.error("No `.stl` files found in the data directory.")
+        st.markdown(
+            "Create `data/` at the project root and place STL files inside it."
+        )
         return
 
+    st.sidebar.header("Project Status")
     st.sidebar.write(f"Meshes found: {len(mesh_paths)}")
     embeddings_norm, stored_paths, meta, stale = load_index(
         INDEX_DIR, backend, mesh_paths
@@ -120,6 +132,10 @@ def main():
         st.info("Build the index to enable search.")
         return
 
+    st.subheader("Search")
+    st.markdown(
+        "Choose a query mesh from your dataset or upload a new STL to find similar items."
+    )
     query_mode = st.radio("Query type", ["Choose from dataset", "Upload STL"])
     query_mesh = None
     query_path = None
@@ -134,6 +150,7 @@ def main():
             st.error(f"Failed to load query mesh: {exc}")
             return
     else:
+        st.info("Upload mode always returns the top 5 most similar results.")
         upload = st.file_uploader("Upload STL", type=["stl"])
         if upload is not None:
             try:
