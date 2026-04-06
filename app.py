@@ -5,6 +5,10 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 
 import streamlit as st
+try:
+    import plotly.graph_objects as go
+except Exception:
+    go = None
 
 from src.config import (
     DATA_DIR,
@@ -65,6 +69,54 @@ def _load_mesh_list() -> Tuple[List[Path], List[str]]:
 def _render_preview(mesh, caption: str):
     img = mesh_preview_png(mesh, points=PREVIEW_POINTS)
     st.image(img, caption=caption, use_column_width=True)
+
+def _mesh_to_plotly(mesh, title: str):
+    if go is None:
+        raise RuntimeError("Plotly is not installed.")
+    if mesh.faces is None or mesh.faces.size == 0:
+        raise ValueError("Mesh has no faces.")
+
+    vertices = mesh.vertices
+    faces = mesh.faces
+
+    max_faces = 50000
+    if len(faces) > max_faces:
+        stride = max(1, int(len(faces) / max_faces))
+        faces = faces[::stride]
+
+    x, y, z = vertices.T
+    i, j, k = faces.T
+
+    fig = go.Figure(
+        data=[
+            go.Mesh3d(
+                x=x,
+                y=y,
+                z=z,
+                i=i,
+                j=j,
+                k=k,
+                color="#7da0c4",
+                opacity=1.0,
+                flatshading=True,
+            )
+        ]
+    )
+    fig.update_layout(
+        title=title,
+        scene_aspectmode="data",
+        scene=dict(
+            xaxis=dict(visible=False),
+            yaxis=dict(visible=False),
+            zaxis=dict(visible=False),
+        ),
+        margin=dict(l=0, r=0, t=30, b=0),
+    )
+    return fig
+
+def _render_3d(mesh, title: str):
+    fig = _mesh_to_plotly(mesh, title)
+    st.plotly_chart(fig, use_container_width=True)
 
 
 def _build_index_with_progress(backend, mesh_paths: List[Path]):
@@ -136,6 +188,10 @@ def main():
     st.markdown(
         "Choose a query mesh from your dataset or upload a new STL to find similar items."
     )
+    show_3d = st.checkbox("Show 3D previews", value=False)
+    if show_3d and go is None:
+        st.warning("3D previews require Plotly. Install with `pip install plotly`.")
+        show_3d = False
     query_mode = st.radio("Query type", ["Choose from dataset", "Upload STL"])
     query_mesh = None
     query_path = None
@@ -145,7 +201,10 @@ def main():
         query_path = DATA_DIR / selection
         try:
             query_mesh = load_mesh(query_path)
-            _render_preview(query_mesh, f"Query: {selection}")
+            if show_3d:
+                _render_3d(query_mesh, f"Query: {selection}")
+            else:
+                _render_preview(query_mesh, f"Query: {selection}")
         except Exception as exc:
             st.error(f"Failed to load query mesh: {exc}")
             return
@@ -155,7 +214,10 @@ def main():
         if upload is not None:
             try:
                 query_mesh = load_mesh_from_bytes(upload.read())
-                _render_preview(query_mesh, "Query (uploaded)")
+                if show_3d:
+                    _render_3d(query_mesh, "Query (uploaded)")
+                else:
+                    _render_preview(query_mesh, "Query (uploaded)")
             except Exception as exc:
                 st.error(f"Failed to load uploaded mesh: {exc}")
                 return
@@ -199,8 +261,15 @@ def main():
             cols = st.columns([1, 3])
             with cols[0]:
                 if mesh is not None:
-                    img = mesh_preview_png(mesh, points=PREVIEW_POINTS)
-                    st.image(img, use_column_width=True)
+                    if show_3d:
+                        try:
+                            _render_3d(mesh, f"{rel}")
+                        except Exception:
+                            img = mesh_preview_png(mesh, points=PREVIEW_POINTS)
+                            st.image(img, use_column_width=True)
+                    else:
+                        img = mesh_preview_png(mesh, points=PREVIEW_POINTS)
+                        st.image(img, use_column_width=True)
                 else:
                     st.write("Preview unavailable")
             with cols[1]:
