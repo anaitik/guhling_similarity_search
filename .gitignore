@@ -3,3 +3,4 @@ index/
 __pycache__/
 *.pyc
 .cache/
+data/
