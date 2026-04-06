@@ -15,17 +15,30 @@ from src.config import (
     DEFAULT_GEMINI_MODEL,
     D2_BINS,
     D2_PAIRS,
+    D2_WEIGHT,
+    EXTENT_WEIGHT,
     GEMINI_API_KEY_ENV,
+    INCLUDE_SCALE,
     INDEX_DIR,
+    LOG_FEATURES,
     POINTS,
     PREVIEW_POINTS,
     RADIAL_BINS,
+    RADIAL_WEIGHT,
+    SCALE_WEIGHT,
+    SIZE_WEIGHT,
+    TOPO_WEIGHT,
 )
 from src.data_loader import list_mesh_files, load_mesh, load_mesh_from_bytes
 from src.embedding_backends import GeminiEmbeddingBackend, LocalEmbeddingBackend
 from src.index_store import build_index, load_index
 from src.preview import mesh_preview_png
-from src.similarity import top_k_cosine
+from src.similarity import (
+    build_weight_vector,
+    prepare_for_search,
+    top_k_cosine,
+    top_k_l2,
+)
 
 try:
     from dotenv import load_dotenv
@@ -50,14 +63,111 @@ def _make_backend():
             st.sidebar.error("Gemini key required to build embeddings.")
             st.stop()
         try:
-            return GeminiEmbeddingBackend(api_key=api_key, model=model)
+            backend = GeminiEmbeddingBackend(api_key=api_key, model=model)
         except ImportError as exc:
             st.sidebar.error(str(exc))
             st.stop()
+        distance_metric = st.sidebar.selectbox(
+            "Distance metric",
+            [
+                "Cosine (weighted)",
+                "L2 (weighted)",
+                "L2 (standardized + weighted)",
+            ],
+        )
+        return backend, None, distance_metric
 
-    return LocalEmbeddingBackend(
-        radial_bins=RADIAL_BINS, d2_bins=D2_BINS, points=POINTS, d2_pairs=D2_PAIRS
+    with st.sidebar.expander("Local accuracy tuning"):
+        st.caption("Higher values improve accuracy but increase build time.")
+        st.info("Changing index parameters requires rebuilding the index.")
+        st.markdown("Index parameters")
+        radial_bins = st.slider(
+            "Radial histogram bins", min_value=8, max_value=128, value=RADIAL_BINS, step=4
+        )
+        d2_bins = st.slider(
+            "D2 histogram bins", min_value=8, max_value=128, value=D2_BINS, step=4
+        )
+        points = st.slider(
+            "Sample points", min_value=512, max_value=8192, value=POINTS, step=256
+        )
+        d2_pairs = st.slider(
+            "D2 pairs", min_value=1024, max_value=20000, value=D2_PAIRS, step=512
+        )
+        include_scale = st.checkbox(
+            "Include scale feature",
+            value=INCLUDE_SCALE,
+            help="Adds overall size as a feature (useful if size matters).",
+        )
+        log_features = st.checkbox(
+            "Log-scale size features",
+            value=LOG_FEATURES,
+            help="Compresses large ranges to balance feature influence.",
+        )
+
+        st.markdown("Search weights (no rebuild required)")
+        radial_weight = st.slider(
+            "Radial weight", min_value=0.0, max_value=3.0, value=RADIAL_WEIGHT, step=0.1
+        )
+        d2_weight = st.slider(
+            "D2 weight", min_value=0.0, max_value=3.0, value=D2_WEIGHT, step=0.1
+        )
+        size_weight = st.slider(
+            "Size/shape weight",
+            min_value=0.0,
+            max_value=3.0,
+            value=SIZE_WEIGHT,
+            step=0.1,
+        )
+        extent_weight = st.slider(
+            "Extent weight",
+            min_value=0.0,
+            max_value=3.0,
+            value=EXTENT_WEIGHT,
+            step=0.1,
+        )
+        topo_weight = st.slider(
+            "Topology weight",
+            min_value=0.0,
+            max_value=3.0,
+            value=TOPO_WEIGHT,
+            step=0.1,
+        )
+        scale_weight = SCALE_WEIGHT
+        if include_scale:
+            scale_weight = st.slider(
+                "Scale weight",
+                min_value=0.0,
+                max_value=3.0,
+                value=SCALE_WEIGHT,
+                step=0.1,
+            )
+
+    distance_metric = st.sidebar.selectbox(
+        "Distance metric",
+        [
+            "Cosine (weighted)",
+            "L2 (weighted)",
+            "L2 (standardized + weighted)",
+        ],
     )
+
+    backend = LocalEmbeddingBackend(
+        radial_bins=radial_bins,
+        d2_bins=d2_bins,
+        points=points,
+        d2_pairs=d2_pairs,
+        include_scale=include_scale,
+        log_features=log_features,
+    )
+    search_settings = {
+        "radial_weight": radial_weight,
+        "d2_weight": d2_weight,
+        "size_weight": size_weight,
+        "extent_weight": extent_weight,
+        "topo_weight": topo_weight,
+        "scale_weight": scale_weight,
+    }
+    return backend, search_settings, distance_metric
 
 
 def _load_mesh_list() -> Tuple[List[Path], List[str]]:
@@ -69,6 +179,7 @@ def _load_mesh_list() -> Tuple[List[Path], List[str]]:
 def _render_preview(mesh, caption: str):
     img = mesh_preview_png(mesh, points=PREVIEW_POINTS)
     st.image(img, caption=caption, use_column_width=True)
+
 
 def _mesh_to_plotly(mesh, title: str):
     if go is None:
@@ -148,7 +259,7 @@ def main():
             """
         )
 
-    backend = _make_backend()
+    backend, search_settings, distance_metric = _make_backend()
     mesh_paths, rel_paths = _load_mesh_list()
 
     if not mesh_paths:
@@ -160,7 +271,7 @@ def main():
 
     st.sidebar.header("Project Status")
     st.sidebar.write(f"Meshes found: {len(mesh_paths)}")
-    embeddings_norm, stored_paths, meta, stale = load_index(
+    embeddings, stored_paths, meta, stale, mean, std = load_index(
         INDEX_DIR, backend, mesh_paths
     )
 
@@ -169,7 +280,7 @@ def main():
         if st.sidebar.button("Build / Rebuild index"):
             with st.spinner("Building index..."):
                 meta = _build_index_with_progress(backend, mesh_paths)
-            embeddings_norm, stored_paths, meta, stale = load_index(
+            embeddings, stored_paths, meta, stale, mean, std = load_index(
                 INDEX_DIR, backend, mesh_paths
             )
     else:
@@ -180,7 +291,7 @@ def main():
             if meta.get("count", 0) < len(mesh_paths):
                 st.sidebar.warning("Index is partial (some meshes failed to embed).")
 
-    if embeddings_norm is None or stale:
+    if embeddings is None or stale:
         st.info("Build the index to enable search.")
         return
 
@@ -237,7 +348,30 @@ def main():
 
         with st.spinner("Embedding query and searching..."):
             query_emb = backend.embed_mesh(query_mesh)
-            results = top_k_cosine(query_emb, embeddings_norm, top_k + 1)
+
+            weight_vec = None
+            if backend.name == "local" and search_settings is not None:
+                weight_vec = build_weight_vector(
+                    backend.radial_bins,
+                    backend.d2_bins,
+                    backend.include_scale,
+                    radial_weight=search_settings["radial_weight"],
+                    d2_weight=search_settings["d2_weight"],
+                    size_weight=search_settings["size_weight"],
+                    extent_weight=search_settings["extent_weight"],
+                    topo_weight=search_settings["topo_weight"],
+                    scale_weight=search_settings["scale_weight"],
+                )
+
+            standardize = distance_metric == "L2 (standardized + weighted)"
+            embeddings_p, query_p = prepare_for_search(
+                embeddings, query_emb, mean, std, weight_vec, standardize
+            )
+
+            if distance_metric.startswith("Cosine"):
+                results = top_k_cosine(query_p, embeddings_p, top_k + 1)
+            else:
+                results = top_k_l2(query_p, embeddings_p, top_k + 1)
 
         if query_path is not None:
             filtered = []
@@ -258,6 +392,10 @@ def main():
             except Exception:
                 mesh = None
 
+            if distance_metric.startswith("Cosine"):
+                score_display = min(max(score, -1.0), 1.0)
+                distance = 1.0 - score_display
+
             cols = st.columns([1, 3])
             with cols[0]:
                 if mesh is not None:
@@ -274,7 +412,13 @@ def main():
                     st.write("Preview unavailable")
             with cols[1]:
                 st.markdown(f"**{rel}**")
-                st.write(f"Similarity score: {score:.4f}")
+                if distance_metric.startswith("Cosine"):
+                    st.write(f"Similarity (cosine): {score_display:.6f}")
+                    st.write(f"Cosine distance: {distance:.6f}")
+                elif distance_metric.startswith("L2 (standardized"):
+                    st.write(f"Distance (standardized L2): {score:.6f}")
+                else:
+                    st.write(f"Distance (L2): {score:.6f}")
 
 
 if __name__ == "__main__":

@@ -16,6 +16,8 @@ class LocalEmbeddingBackend:
     points: int = 2048
     d2_pairs: int = 4096
     seed: int = 123
+    include_scale: bool = False
+    log_features: bool = False
 
     name: str = "local"
 
@@ -27,6 +29,8 @@ class LocalEmbeddingBackend:
             points=self.points,
             d2_pairs=self.d2_pairs,
             seed=self.seed,
+            include_scale=self.include_scale,
+            log_features=self.log_features,
         )
 
     def signature(self) -> Dict[str, object]:
@@ -37,4 +41,6 @@ class LocalEmbeddingBackend:
             "points": self.points,
             "d2_pairs": self.d2_pairs,
             "seed": self.seed,
+            "include_scale": self.include_scale,
+            "log_features": self.log_features,
         }

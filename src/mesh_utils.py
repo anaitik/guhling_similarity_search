@@ -4,7 +4,7 @@ import numpy as np
 import trimesh
 
 
-def normalize_mesh(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
+def _normalize_mesh_internal(mesh: trimesh.Trimesh):
     mesh = mesh.copy()
     if mesh.vertices.size == 0:
         raise ValueError("Mesh has no vertices")
@@ -17,7 +17,16 @@ def normalize_mesh(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
         # If inertia alignment fails, keep original orientation.
         pass
 
-    max_radius = np.linalg.norm(mesh.vertices, axis=1).max()
+    max_radius = float(np.linalg.norm(mesh.vertices, axis=1).max())
     if max_radius > 0:
         mesh.apply_scale(1.0 / max_radius)
-    return mesh
+    return mesh, max_radius
+
+
+def normalize_mesh(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
+    mesh_n, _ = _normalize_mesh_internal(mesh)
+    return mesh_n
+
+
+def normalize_mesh_with_scale(mesh: trimesh.Trimesh):
+    return _normalize_mesh_internal(mesh)

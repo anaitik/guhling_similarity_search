@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import trimesh
 
-from .mesh_utils import normalize_mesh
+from .mesh_utils import normalize_mesh_with_scale
 
 
 def compute_shape_features(
@@ -13,8 +13,10 @@ def compute_shape_features(
     points: int = 2048,
     d2_pairs: int = 4096,
     seed: int = 123,
+    include_scale: bool = False,
+    log_features: bool = False,
 ) -> np.ndarray:
-    mesh_n = normalize_mesh(mesh)
+    mesh_n, scale = normalize_mesh_with_scale(mesh)
 
     try:
         pts = mesh_n.sample(points)
@@ -53,13 +55,26 @@ def compute_shape_features(
     faces = float(mesh_n.faces.shape[0]) if mesh_n.faces is not None else 0.0
     verts = float(mesh_n.vertices.shape[0])
 
+    if log_features:
+        area = float(np.log1p(area))
+        volume = float(np.log1p(volume))
+        extents = np.log1p(extents)
+        faces = float(np.log1p(faces))
+        verts = float(np.log1p(verts))
+        scale = float(np.log1p(scale)) if scale > 0 else 0.0
+
+    size_feats = np.array([area, volume, sphericity], dtype=float)
+    topo_feats = np.array([faces, verts], dtype=float)
+    extra_feats = [np.array([scale], dtype=float)] if include_scale else []
+
     feature = np.concatenate(
         [
             radial_hist,
             d2_hist,
-            np.array([area, volume, sphericity], dtype=float),
+            size_feats,
             extents,
-            np.array([faces, verts], dtype=float),
+            topo_feats,
+            *extra_feats,
         ]
     )
     feature = np.nan_to_num(feature, nan=0.0, posinf=0.0, neginf=0.0)
