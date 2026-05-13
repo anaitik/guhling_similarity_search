@@ -8,6 +8,10 @@ DATA_DIR = BASE_DIR / "data"
 INDEX_DIR = BASE_DIR / "index"
 
 DEFAULT_BACKEND = "local"
+DEFAULT_BERT_MODEL = os.getenv("BERT_MODEL", "google/bert_uncased_L-2_H-128_A-2")
+BERT_MAX_LENGTH = int(os.getenv("BERT_MAX_LENGTH", "128"))
+BERT_SAMPLE_POINTS = int(os.getenv("BERT_SAMPLE_POINTS", "1024"))
+BERT_DEVICE = os.getenv("BERT_DEVICE", "cpu")
 
 RADIAL_BINS = int(os.getenv("RADIAL_BINS", "32"))
 D2_BINS = int(os.getenv("D2_BINS", "32"))

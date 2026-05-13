@@ -11,7 +11,11 @@ except Exception:
     go = None
 
 from src.config import (
+    BERT_DEVICE,
+    BERT_MAX_LENGTH,
+    BERT_SAMPLE_POINTS,
     DATA_DIR,
+    DEFAULT_BERT_MODEL,
     DEFAULT_GEMINI_MODEL,
     D2_BINS,
     D2_PAIRS,
@@ -30,7 +34,19 @@ from src.config import (
     TOPO_WEIGHT,
 )
 from src.data_loader import list_mesh_files, load_mesh, load_mesh_from_bytes
-from src.embedding_backends import GeminiEmbeddingBackend, LocalEmbeddingBackend
+from src.embedding_backends import (
+    AutoencoderLatentEmbeddingBackend,
+    BertEmbeddingBackend,
+    GeminiEmbeddingBackend,
+    GraphSpectralEmbeddingBackend,
+    HybridEmbeddingBackend,
+    LocalEmbeddingBackend,
+    MultiViewProjectionEmbeddingBackend,
+    PartFeatureEmbeddingBackend,
+    PointCloudEmbeddingBackend,
+    SemanticProfileEmbeddingBackend,
+    VoxelEmbeddingBackend,
+)
 from src.index_store import build_index, load_index
 from src.preview import mesh_preview_png
 from src.similarity import (
@@ -48,11 +64,244 @@ except Exception:
     pass
 
 
+BACKEND_DESCRIPTIONS = {
+    "Hybrid: combine methods": (
+        "Builds several local embeddings for each mesh, normalizes each one, applies "
+        "your weights, concatenates them, and searches the combined vector."
+    ),
+    "Semantic: functional profile": (
+        "Infers object-like affordances such as mounting, support, handle/shaft, "
+        "container, ring/clip, perforated plate, and mechanical complexity, then "
+        "searches by that semantic profile."
+    ),
+    "BERT (local transformer)": (
+        "Converts each STL into a geometric text description, embeds that text with a "
+        "local BERT model, then searches by vector similarity."
+    ),
+    "Experimental: graph spectral": (
+        "Treats the mesh as a vertex-edge graph, computes Laplacian eigenvalues, and "
+        "compares those topology/structure signatures."
+    ),
+    "Experimental: voxel grid": (
+        "Samples the mesh surface into a 3D occupancy grid, then compares filled voxel "
+        "patterns like a low-resolution 3D image."
+    ),
+    "Experimental: point cloud": (
+        "Samples points from the mesh surface and builds coordinate, radial, and "
+        "covariance features to compare overall 3D point distributions."
+    ),
+    "Experimental: multi-view projection": (
+        "Projects sampled 3D points onto multiple 2D planes, builds view histograms, "
+        "then compares those visual silhouettes."
+    ),
+    "Experimental: part features": (
+        "Extracts compact geometric cues such as extents, aspect ratios, normals, "
+        "surface area, volume, watertightness, and face/vertex counts."
+    ),
+    "Experimental: autoencoder latent": (
+        "Builds a voxel grid and compresses it into a deterministic latent vector, "
+        "similar to an autoencoder-style compressed representation."
+    ),
+    "Local shape features (fast, offline)": (
+        "Uses handcrafted radial and point-pair distance histograms plus size, extent, "
+        "and topology features. Fast, explainable, and fully offline."
+    ),
+    "Gemini (API, slower/costs)": (
+        "Converts mesh geometry into text and sends it to Gemini embeddings, then "
+        "searches using the returned API embedding vectors."
+    ),
+}
+
+
 def _make_backend():
     backend_choice = st.sidebar.selectbox(
         "Embedding backend",
-        ["Local (fast, offline)", "Gemini (API, slower/costs)"],
+        [
+            "Hybrid: combine methods",
+            "Semantic: functional profile",
+            "BERT (local transformer)",
+            "Experimental: graph spectral",
+            "Experimental: voxel grid",
+            "Experimental: point cloud",
+            "Experimental: multi-view projection",
+            "Experimental: part features",
+            "Experimental: autoencoder latent",
+            "Local shape features (fast, offline)",
+            "Gemini (API, slower/costs)",
+        ],
     )
+    st.sidebar.info(BACKEND_DESCRIPTIONS[backend_choice])
+
+    if backend_choice.startswith("Hybrid"):
+        with st.sidebar.expander("Hybrid method weights", expanded=True):
+            st.info("Weights of 0 disable a method. Changing weights requires rebuilding the index.")
+            graph_weight = st.slider("Graph spectral weight", 0.0, 3.0, 1.0, step=0.1)
+            voxel_weight = st.slider("Voxel grid weight", 0.0, 3.0, 1.0, step=0.1)
+            point_weight = st.slider("Point cloud weight", 0.0, 3.0, 1.0, step=0.1)
+            multiview_weight = st.slider("Multi-view weight", 0.0, 3.0, 1.0, step=0.1)
+            part_weight = st.slider("Part features weight", 0.0, 3.0, 1.0, step=0.1)
+            semantic_weight = st.slider("Semantic profile weight", 0.0, 3.0, 1.0, step=0.1)
+            latent_weight = st.slider("Autoencoder latent weight", 0.0, 3.0, 0.5, step=0.1)
+            include_bert = st.checkbox(
+                "Include BERT",
+                value=False,
+                help="Adds the local BERT descriptor embedding. Slower and loads the BERT model.",
+            )
+            bert_weight = 0.0
+            if include_bert:
+                bert_weight = st.slider("BERT weight", 0.0, 3.0, 0.5, step=0.1)
+
+        backends = [
+            GraphSpectralEmbeddingBackend(),
+            VoxelEmbeddingBackend(),
+            PointCloudEmbeddingBackend(),
+            MultiViewProjectionEmbeddingBackend(),
+            PartFeatureEmbeddingBackend(),
+            SemanticProfileEmbeddingBackend(),
+            AutoencoderLatentEmbeddingBackend(),
+        ]
+        weights = [
+            graph_weight,
+            voxel_weight,
+            point_weight,
+            multiview_weight,
+            part_weight,
+            semantic_weight,
+            latent_weight,
+        ]
+        if include_bert:
+            try:
+                backends.append(BertEmbeddingBackend())
+                weights.append(bert_weight)
+            except Exception as exc:
+                st.sidebar.error(str(exc))
+                st.stop()
+
+        try:
+            backend = HybridEmbeddingBackend(backends=backends, weights=weights)
+        except ValueError as exc:
+            st.sidebar.error(str(exc))
+            st.stop()
+
+        distance_metric = st.sidebar.selectbox(
+            "Distance metric",
+            [
+                "Cosine",
+                "L2 (standardized)",
+                "L2",
+            ],
+        )
+        return backend, None, distance_metric
+
+    if backend_choice.startswith("Semantic"):
+        with st.sidebar.expander("Semantic profile settings", expanded=True):
+            st.info("Changing semantic profile settings requires rebuilding the index.")
+            points = st.slider("Sample points", 512, 8192, 2048, step=256)
+        backend = SemanticProfileEmbeddingBackend(points=points)
+        distance_metric = st.sidebar.selectbox(
+            "Distance metric",
+            [
+                "Cosine",
+                "L2 (standardized)",
+                "L2",
+            ],
+        )
+        return backend, None, distance_metric
+
+    if backend_choice.startswith("Experimental"):
+        with st.sidebar.expander("Experimental backend settings", expanded=True):
+            st.info("Changing these settings requires rebuilding the index.")
+
+            if "graph spectral" in backend_choice:
+                eigen_count = st.slider("Eigenvalue count", 16, 128, 64, step=8)
+                max_vertices = st.slider("Max graph vertices", 200, 1500, 700, step=100)
+                backend = GraphSpectralEmbeddingBackend(
+                    eigen_count=eigen_count,
+                    max_vertices=max_vertices,
+                )
+            elif "voxel grid" in backend_choice:
+                resolution = st.slider("Voxel resolution", 8, 32, 16, step=4)
+                points = st.slider("Sample points", 1024, 12000, 4096, step=512)
+                backend = VoxelEmbeddingBackend(resolution=resolution, points=points)
+            elif "point cloud" in backend_choice:
+                points = st.slider("Sample points", 512, 8192, 2048, step=256)
+                bins = st.slider("Histogram bins", 8, 64, 32, step=4)
+                backend = PointCloudEmbeddingBackend(points=points, bins=bins)
+            elif "multi-view projection" in backend_choice:
+                points = st.slider("Sample points", 1024, 12000, 4096, step=512)
+                image_bins = st.slider("Projection bins", 12, 48, 24, step=4)
+                backend = MultiViewProjectionEmbeddingBackend(
+                    points=points,
+                    image_bins=image_bins,
+                )
+            elif "part features" in backend_choice:
+                normal_bins = st.slider("Normal histogram bins", 6, 36, 12, step=3)
+                backend = PartFeatureEmbeddingBackend(normal_bins=normal_bins)
+            else:
+                resolution = st.slider("Voxel resolution", 8, 32, 16, step=4)
+                latent_dim = st.slider("Latent dimensions", 32, 512, 128, step=32)
+                points = st.slider("Sample points", 1024, 12000, 4096, step=512)
+                backend = AutoencoderLatentEmbeddingBackend(
+                    resolution=resolution,
+                    latent_dim=latent_dim,
+                    points=points,
+                )
+
+        distance_metric = st.sidebar.selectbox(
+            "Distance metric",
+            [
+                "Cosine",
+                "L2 (standardized)",
+                "L2",
+            ],
+        )
+        return backend, None, distance_metric
+
+    if backend_choice.startswith("BERT"):
+        with st.sidebar.expander("BERT settings", expanded=True):
+            st.caption("BERT embeds a generated geometric description for each mesh.")
+            st.info("Changing BERT settings requires rebuilding the index.")
+            model_name = st.text_input("BERT model", value=DEFAULT_BERT_MODEL)
+            max_length = st.slider(
+                "Max token length",
+                min_value=64,
+                max_value=512,
+                value=BERT_MAX_LENGTH,
+                step=32,
+            )
+            sample_points = st.slider(
+                "Descriptor sample points",
+                min_value=256,
+                max_value=4096,
+                value=BERT_SAMPLE_POINTS,
+                step=256,
+            )
+            device = st.selectbox(
+                "Device",
+                ["cpu", "cuda"],
+                index=1 if BERT_DEVICE == "cuda" else 0,
+                help="Use cuda only if PyTorch can see a CUDA GPU.",
+            )
+        try:
+            backend = BertEmbeddingBackend(
+                model_name=model_name,
+                max_length=max_length,
+                sample_points=sample_points,
+                device=device,
+            )
+        except Exception as exc:
+            st.sidebar.error(str(exc))
+            st.stop()
+        distance_metric = st.sidebar.selectbox(
+            "Distance metric",
+            [
+                "Cosine",
+                "L2 (standardized)",
+                "L2",
+            ],
+        )
+        return backend, None, distance_metric
+
     if backend_choice.startswith("Gemini"):
         st.sidebar.warning("Gemini backend calls the API for each mesh (may cost).")
         api_key = os.getenv(GEMINI_API_KEY_ENV, "")
@@ -70,9 +319,9 @@ def _make_backend():
         distance_metric = st.sidebar.selectbox(
             "Distance metric",
             [
-                "Cosine (weighted)",
-                "L2 (weighted)",
-                "L2 (standardized + weighted)",
+                "Cosine",
+                "L2",
+                "L2 (standardized)",
             ],
         )
         return backend, None, distance_metric
@@ -363,7 +612,7 @@ def main():
                     scale_weight=search_settings["scale_weight"],
                 )
 
-            standardize = distance_metric == "L2 (standardized + weighted)"
+            standardize = distance_metric in {"L2 (standardized)", "L2 (standardized + weighted)"}
             embeddings_p, query_p = prepare_for_search(
                 embeddings, query_emb, mean, std, weight_vec, standardize
             )
