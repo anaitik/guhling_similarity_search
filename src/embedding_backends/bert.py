@@ -14,7 +14,7 @@ class BertEmbeddingBackend:
     model_name: str = "google/bert_uncased_L-2_H-128_A-2"
     max_length: int = 128
     device: str = "cpu"
-    descriptor_version: int = 1
+    descriptor_version: int = 2
     sample_points: int = 1024
 
     name: str = "bert"
@@ -35,8 +35,7 @@ class BertEmbeddingBackend:
         self._model.to(self.device)
         self._model.eval()
 
-    def embed_mesh(self, mesh: trimesh.Trimesh) -> np.ndarray:
-        text = mesh_descriptor_text(mesh, sample_points=self.sample_points)
+    def embed_text(self, text: str) -> np.ndarray:
         tokens = self._tokenizer(
             text,
             padding=True,
@@ -59,6 +58,16 @@ class BertEmbeddingBackend:
         if norm > 0:
             vector = vector / norm
         return vector
+
+    def embed_mesh(self, mesh: trimesh.Trimesh) -> np.ndarray:
+        text = mesh_descriptor_text(mesh, sample_points=self.sample_points)
+        return self.embed_text(text)
+
+    def embed_mesh_with_context(self, mesh: trimesh.Trimesh, context: str) -> np.ndarray:
+        text = mesh_descriptor_text(mesh, sample_points=self.sample_points)
+        if context:
+            text = f"{text} Product catalog context: {context}."
+        return self.embed_text(text)
 
     def signature(self) -> Dict[str, object]:
         return {

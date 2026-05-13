@@ -20,6 +20,20 @@ def _index_files(index_dir: Path, backend_name: str) -> Dict[str, Path]:
     }
 
 
+def _path_context(path: Path) -> str:
+    parts = []
+    for item in [path.parent.name, path.stem]:
+        cleaned = (
+            item.replace("_", " ")
+            .replace("-", " ")
+            .replace(".", " ")
+            .strip()
+        )
+        if cleaned:
+            parts.append(cleaned)
+    return " ".join(parts)
+
+
 def load_index(
     index_dir: Path,
     backend,
@@ -77,7 +91,10 @@ def build_index(
     for i, path in enumerate(data_paths, start=1):
         try:
             mesh = load_mesh(path)
-            emb = backend.embed_mesh(mesh)
+            if hasattr(backend, "embed_mesh_with_context"):
+                emb = backend.embed_mesh_with_context(mesh, _path_context(path))
+            else:
+                emb = backend.embed_mesh(mesh)
             embeddings.append(emb)
             stored_paths.append(str(path))
         except Exception as exc:

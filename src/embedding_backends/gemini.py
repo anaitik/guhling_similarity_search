@@ -13,7 +13,7 @@ from ..mesh_descriptor import mesh_descriptor_text
 class GeminiEmbeddingBackend:
     api_key: str
     model: str = "models/embedding-001"
-    descriptor_version: int = 1
+    descriptor_version: int = 2
 
     name: str = "gemini"
 
@@ -31,9 +31,8 @@ class GeminiEmbeddingBackend:
         self._genai = genai
         self._genai.configure(api_key=self.api_key)
 
-    def embed_mesh(self, mesh: trimesh.Trimesh) -> np.ndarray:
-        text = mesh_descriptor_text(mesh)
-        response = self._genai.embed_content(model=self.model, content=text)
+    def _embed_content(self, content: str) -> np.ndarray:
+        response = self._genai.embed_content(model=self.model, content=content)
         embedding = None
         if isinstance(response, dict):
             embedding = response.get("embedding")
@@ -45,6 +44,19 @@ class GeminiEmbeddingBackend:
         if embedding is None:
             raise ValueError("Gemini embedding response did not include an embedding")
         return np.array(embedding, dtype=np.float32)
+
+    def embed_text(self, text: str) -> np.ndarray:
+        return self._embed_content(text)
+
+    def embed_mesh(self, mesh: trimesh.Trimesh) -> np.ndarray:
+        text = mesh_descriptor_text(mesh)
+        return self._embed_content(text)
+
+    def embed_mesh_with_context(self, mesh: trimesh.Trimesh, context: str) -> np.ndarray:
+        text = mesh_descriptor_text(mesh)
+        if context:
+            text = f"{text} Product/catalog context: {context}."
+        return self._embed_content(text)
 
     def signature(self) -> Dict[str, object]:
         return {

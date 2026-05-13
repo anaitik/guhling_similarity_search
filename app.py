@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import List, Tuple
 
 import streamlit as st
 try:
@@ -492,6 +492,129 @@ def _build_index_with_progress(backend, mesh_paths: List[Path]):
     return meta
 
 
+def _read_uploaded_text(files) -> str:
+    chunks = []
+    for file in files or []:
+        raw = file.read()
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            text = raw.decode("latin-1", errors="ignore")
+        text = text.strip()
+        if text:
+            chunks.append(f"File: {file.name}\n{text}")
+    return "\n\n".join(chunks)
+
+
+def _build_rag_query(user_text: str, file_context: str) -> str:
+    combined = f"{user_text}\n{file_context}".lower()
+    vocabulary = {
+        "mounting or bracket": ["bracket", "mount", "holder", "support", "fixture", "base"],
+        "holes or fasteners": ["hole", "screw", "bolt", "fastener", "slot", "perforated"],
+        "cylindrical or round": ["cylinder", "round", "tube", "pipe", "shaft", "ring", "wheel"],
+        "flat or plate-like": ["flat", "plate", "panel", "thin", "rectangular"],
+        "container or shell": ["cup", "bowl", "container", "case", "cover", "shell", "housing"],
+        "handle or grip": ["handle", "grip", "lever", "knob"],
+        "long or elongated": ["long", "rod", "bar", "rail", "elongated"],
+        "compact or blocky": ["compact", "block", "cube", "box"],
+        "mechanical detail": ["gear", "tooth", "teeth", "hinge", "joint", "thread", "connector"],
+    }
+    inferred_terms = [
+        label
+        for label, words in vocabulary.items()
+        if any(word in combined for word in words)
+    ]
+
+    parts = [
+        "3D mesh geometry descriptor search query.",
+        "Match indexed STL models by shape, function, proportions, topology, and visible product affordances.",
+        "Important geometry words: flat, elongated, compact, roundish, open, watertight, holes, base, shaft, ring, shell, bracket, handle, connector, mechanical.",
+    ]
+    if inferred_terms:
+        parts.append("Inferred product features: " + ", ".join(inferred_terms) + ".")
+    if file_context:
+        parts.append("Uploaded product notes:\n" + file_context[:30000])
+    if user_text:
+        parts.append("User request:\n" + user_text.strip())
+    parts.append(
+        "Return closest 3D STL matches even when exact product names differ; prefer geometry and functional affordance similarity."
+    )
+    return "\n\n".join(parts)
+
+
+def _search_index(
+    query_emb,
+    embeddings,
+    mean,
+    std,
+    backend,
+    search_settings,
+    distance_metric: str,
+    top_k: int,
+):
+    weight_vec = None
+    if backend.name == "local" and search_settings is not None:
+        weight_vec = build_weight_vector(
+            backend.radial_bins,
+            backend.d2_bins,
+            backend.include_scale,
+            radial_weight=search_settings["radial_weight"],
+            d2_weight=search_settings["d2_weight"],
+            size_weight=search_settings["size_weight"],
+            extent_weight=search_settings["extent_weight"],
+            topo_weight=search_settings["topo_weight"],
+            scale_weight=search_settings["scale_weight"],
+        )
+
+    standardize = distance_metric in {"L2 (standardized)", "L2 (standardized + weighted)"}
+    embeddings_p, query_p = prepare_for_search(
+        embeddings, query_emb, mean, std, weight_vec, standardize
+    )
+
+    if distance_metric.startswith("Cosine"):
+        return top_k_cosine(query_p, embeddings_p, top_k)
+    return top_k_l2(query_p, embeddings_p, top_k)
+
+
+def _render_results(results, stored_paths, distance_metric: str, show_3d: bool):
+    st.subheader("Results")
+    for idx, score in results:
+        path = Path(stored_paths[idx])
+        rel = path.relative_to(DATA_DIR)
+        try:
+            mesh = load_mesh(path)
+        except Exception:
+            mesh = None
+
+        if distance_metric.startswith("Cosine"):
+            score_display = min(max(score, -1.0), 1.0)
+            distance = 1.0 - score_display
+
+        cols = st.columns([1, 3])
+        with cols[0]:
+            if mesh is not None:
+                if show_3d:
+                    try:
+                        _render_3d(mesh, f"{rel}")
+                    except Exception:
+                        img = mesh_preview_png(mesh, points=PREVIEW_POINTS)
+                        st.image(img, use_column_width=True)
+                else:
+                    img = mesh_preview_png(mesh, points=PREVIEW_POINTS)
+                    st.image(img, use_column_width=True)
+            else:
+                st.write("Preview unavailable")
+        with cols[1]:
+            st.markdown(f"**{rel}**")
+            if distance_metric.startswith("Cosine"):
+                st.write(f"Similarity (cosine): {score_display:.6f}")
+                st.write(f"Cosine distance: {distance:.6f}")
+            elif distance_metric.startswith("L2 (standardized"):
+                st.write(f"Distance (standardized L2): {score:.6f}")
+            else:
+                st.write(f"Distance (L2): {score:.6f}")
+
+
 def main():
     st.set_page_config(
         page_title="3D Mesh Similarity Search",
@@ -546,15 +669,18 @@ def main():
 
     st.subheader("Search")
     st.markdown(
-        "Choose a query mesh from your dataset or upload a new STL to find similar items."
+        "Choose a query mesh, upload a new STL, or use the RAG product agent to search from text/files."
     )
     show_3d = st.checkbox("Show 3D previews", value=False)
     if show_3d and go is None:
         st.warning("3D previews require Plotly. Install with `pip install plotly`.")
         show_3d = False
-    query_mode = st.radio("Query type", ["Choose from dataset", "Upload STL"])
+    query_modes = ["Choose from dataset", "Upload STL", "RAG product agent"]
+    query_mode = st.radio("Query type", query_modes)
     query_mesh = None
     query_path = None
+    text_query = ""
+    uploaded_text = ""
 
     if query_mode == "Choose from dataset":
         selection = st.selectbox("Select a mesh", rel_paths)
@@ -568,7 +694,7 @@ def main():
         except Exception as exc:
             st.error(f"Failed to load query mesh: {exc}")
             return
-    else:
+    elif query_mode == "Upload STL":
         st.info("Upload mode always returns the top 5 most similar results.")
         upload = st.file_uploader("Upload STL", type=["stl"])
         if upload is not None:
@@ -581,6 +707,30 @@ def main():
             except Exception as exc:
                 st.error(f"Failed to load uploaded mesh: {exc}")
                 return
+    else:
+        if not hasattr(backend, "embed_text"):
+            st.warning(
+                "The RAG product agent needs a text-capable backend. Use Gemini or BERT, "
+                "then build the index for that backend."
+            )
+        st.markdown("Upload product notes/specs and ask for the kind of item you want to find.")
+        rag_files = st.file_uploader(
+            "Upload product file",
+            type=["txt", "md", "csv", "json", "log"],
+            accept_multiple_files=True,
+        )
+        uploaded_text = _read_uploaded_text(rag_files)
+        text_query = st.text_area(
+            "Describe the product or ask the agent",
+            placeholder=(
+                "Example: Find a compact mounting bracket with a flat base, two screw holes, "
+                "and a raised cylindrical support."
+            ),
+            height=140,
+        )
+        if uploaded_text:
+            with st.expander("Uploaded text preview"):
+                st.text(uploaded_text[:5000])
 
     top_k = None
     if query_mode == "Upload STL":
@@ -591,36 +741,45 @@ def main():
     run = st.button("Search")
 
     if run:
+        if query_mode == "RAG product agent":
+            if not hasattr(backend, "embed_text"):
+                st.error("Switch to Gemini or BERT to search from text/files.")
+                return
+            if not text_query.strip() and not uploaded_text:
+                st.error("Describe the product or upload a product file first.")
+                return
+            with st.spinner("Reading context, embedding text query, and searching..."):
+                rag_query = _build_rag_query(text_query, uploaded_text)
+                query_emb = backend.embed_text(rag_query)
+                results = _search_index(
+                    query_emb,
+                    embeddings,
+                    mean,
+                    std,
+                    backend,
+                    search_settings,
+                    distance_metric,
+                    top_k,
+                )
+            _render_results(results, stored_paths, distance_metric, show_3d)
+            return
+
         if query_mesh is None:
             st.error("Provide a query mesh first.")
             return
 
         with st.spinner("Embedding query and searching..."):
             query_emb = backend.embed_mesh(query_mesh)
-
-            weight_vec = None
-            if backend.name == "local" and search_settings is not None:
-                weight_vec = build_weight_vector(
-                    backend.radial_bins,
-                    backend.d2_bins,
-                    backend.include_scale,
-                    radial_weight=search_settings["radial_weight"],
-                    d2_weight=search_settings["d2_weight"],
-                    size_weight=search_settings["size_weight"],
-                    extent_weight=search_settings["extent_weight"],
-                    topo_weight=search_settings["topo_weight"],
-                    scale_weight=search_settings["scale_weight"],
-                )
-
-            standardize = distance_metric in {"L2 (standardized)", "L2 (standardized + weighted)"}
-            embeddings_p, query_p = prepare_for_search(
-                embeddings, query_emb, mean, std, weight_vec, standardize
+            results = _search_index(
+                query_emb,
+                embeddings,
+                mean,
+                std,
+                backend,
+                search_settings,
+                distance_metric,
+                top_k + 1,
             )
-
-            if distance_metric.startswith("Cosine"):
-                results = top_k_cosine(query_p, embeddings_p, top_k + 1)
-            else:
-                results = top_k_l2(query_p, embeddings_p, top_k + 1)
 
         if query_path is not None:
             filtered = []
@@ -632,42 +791,7 @@ def main():
         else:
             results = results[:top_k]
 
-        st.subheader("Results")
-        for idx, score in results:
-            path = Path(stored_paths[idx])
-            rel = path.relative_to(DATA_DIR)
-            try:
-                mesh = load_mesh(path)
-            except Exception:
-                mesh = None
-
-            if distance_metric.startswith("Cosine"):
-                score_display = min(max(score, -1.0), 1.0)
-                distance = 1.0 - score_display
-
-            cols = st.columns([1, 3])
-            with cols[0]:
-                if mesh is not None:
-                    if show_3d:
-                        try:
-                            _render_3d(mesh, f"{rel}")
-                        except Exception:
-                            img = mesh_preview_png(mesh, points=PREVIEW_POINTS)
-                            st.image(img, use_column_width=True)
-                    else:
-                        img = mesh_preview_png(mesh, points=PREVIEW_POINTS)
-                        st.image(img, use_column_width=True)
-                else:
-                    st.write("Preview unavailable")
-            with cols[1]:
-                st.markdown(f"**{rel}**")
-                if distance_metric.startswith("Cosine"):
-                    st.write(f"Similarity (cosine): {score_display:.6f}")
-                    st.write(f"Cosine distance: {distance:.6f}")
-                elif distance_metric.startswith("L2 (standardized"):
-                    st.write(f"Distance (standardized L2): {score:.6f}")
-                else:
-                    st.write(f"Distance (L2): {score:.6f}")
+        _render_results(results, stored_paths, distance_metric, show_3d)
 
 
 if __name__ == "__main__":
