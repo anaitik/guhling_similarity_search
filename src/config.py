@@ -5,6 +5,7 @@ from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 DATA_DIR = BASE_DIR / "data"
+STEP_DATA_DIR = BASE_DIR / "step_data"
 INDEX_DIR = BASE_DIR / "index"
 
 DEFAULT_BACKEND = "local"

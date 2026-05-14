@@ -31,12 +31,15 @@ from src.config import (
     RADIAL_WEIGHT,
     SCALE_WEIGHT,
     SIZE_WEIGHT,
+    STEP_DATA_DIR,
     TOPO_WEIGHT,
 )
-from src.data_loader import list_mesh_files, load_mesh, load_mesh_from_bytes
+from src.data_loader import list_mesh_files, list_step_files, load_mesh, load_mesh_from_bytes
 from src.embedding_backends import (
     AutoencoderLatentEmbeddingBackend,
     BertEmbeddingBackend,
+    BRepMAEEmbeddingBackend,
+    CADGCLEmbeddingBackend,
     GeminiEmbeddingBackend,
     GraphSpectralEmbeddingBackend,
     HybridEmbeddingBackend,
@@ -77,6 +80,14 @@ BACKEND_DESCRIPTIONS = {
     "BERT (local transformer)": (
         "Converts each STL into a geometric text description, embeds that text with a "
         "local BERT model, then searches by vector similarity."
+    ),
+    "BRepMAE (STEP B-rep)": (
+        "Indexes STEP/STP files with a masked B-rep descriptor encoder inspired by "
+        "BRepMAE. Put STEP files in the step_data/ folder and rebuild this index."
+    ),
+    "CADGCL (STEP B-rep)": (
+        "Indexes STEP/STP files with graph-style B-rep descriptors and deterministic "
+        "contrastive augmentations inspired by CADGCL."
     ),
     "Experimental: graph spectral": (
         "Treats the mesh as a vertex-edge graph, computes Laplacian eigenvalues, and "
@@ -120,6 +131,8 @@ def _make_backend():
             "Hybrid: combine methods",
             "Semantic: functional profile",
             "BERT (local transformer)",
+            "BRepMAE (STEP B-rep)",
+            "CADGCL (STEP B-rep)",
             "Experimental: graph spectral",
             "Experimental: voxel grid",
             "Experimental: point cloud",
@@ -302,6 +315,48 @@ def _make_backend():
         )
         return backend, None, distance_metric
 
+    if backend_choice.startswith("BRepMAE"):
+        with st.sidebar.expander("BRepMAE settings", expanded=True):
+            st.info("This backend indexes `.step` / `.stp` files from `step_data/`.")
+            latent_dim = st.slider("Latent dimensions", 32, 512, 128, step=32)
+            mask_ratio = st.slider("Mask ratio", 0.05, 0.8, 0.35, step=0.05)
+            views = st.slider("Masked views", 2, 16, 8, step=1)
+        backend = BRepMAEEmbeddingBackend(
+            latent_dim=latent_dim,
+            mask_ratio=mask_ratio,
+            views=views,
+        )
+        distance_metric = st.sidebar.selectbox(
+            "Distance metric",
+            [
+                "Cosine",
+                "L2 (standardized)",
+                "L2",
+            ],
+        )
+        return backend, None, distance_metric
+
+    if backend_choice.startswith("CADGCL"):
+        with st.sidebar.expander("CADGCL settings", expanded=True):
+            st.info("This backend indexes `.step` / `.stp` files from `step_data/`.")
+            latent_dim = st.slider("Latent dimensions", 32, 512, 128, step=32)
+            augmentations = st.slider("Contrastive augmentations", 2, 16, 6, step=1)
+            drop_ratio = st.slider("Feature drop ratio", 0.0, 0.7, 0.2, step=0.05)
+        backend = CADGCLEmbeddingBackend(
+            latent_dim=latent_dim,
+            augmentations=augmentations,
+            drop_ratio=drop_ratio,
+        )
+        distance_metric = st.sidebar.selectbox(
+            "Distance metric",
+            [
+                "Cosine",
+                "L2 (standardized)",
+                "L2",
+            ],
+        )
+        return backend, None, distance_metric
+
     if backend_choice.startswith("Gemini"):
         st.sidebar.warning("Gemini backend calls the API for each mesh (may cost).")
         api_key = os.getenv(GEMINI_API_KEY_ENV, "")
@@ -423,6 +478,24 @@ def _load_mesh_list() -> Tuple[List[Path], List[str]]:
     paths = list_mesh_files(DATA_DIR)
     rel_paths = [str(p.relative_to(DATA_DIR)) for p in paths]
     return paths, rel_paths
+
+
+def _backend_data_dir(backend) -> Path:
+    if hasattr(backend, "embed_path"):
+        return STEP_DATA_DIR
+    return DATA_DIR
+
+
+def _load_data_list(backend) -> Tuple[List[Path], List[str], Path, str]:
+    data_dir = _backend_data_dir(backend)
+    if hasattr(backend, "embed_path"):
+        paths = list_step_files(data_dir)
+        label = "STEP/STP"
+    else:
+        paths = list_mesh_files(data_dir)
+        label = "STL"
+    rel_paths = [str(p.relative_to(data_dir)) for p in paths]
+    return paths, rel_paths, data_dir, label
 
 
 def _render_preview(mesh, caption: str):
@@ -576,13 +649,13 @@ def _search_index(
     return top_k_l2(query_p, embeddings_p, top_k)
 
 
-def _render_results(results, stored_paths, distance_metric: str, show_3d: bool):
+def _render_results(results, stored_paths, data_dir: Path, distance_metric: str, show_3d: bool):
     st.subheader("Results")
     for idx, score in results:
         path = Path(stored_paths[idx])
-        rel = path.relative_to(DATA_DIR)
+        rel = path.relative_to(data_dir)
         try:
-            mesh = load_mesh(path)
+            mesh = load_mesh(path) if path.suffix.lower() == ".stl" else None
         except Exception:
             mesh = None
 
@@ -603,7 +676,7 @@ def _render_results(results, stored_paths, distance_metric: str, show_3d: bool):
                     img = mesh_preview_png(mesh, points=PREVIEW_POINTS)
                     st.image(img, use_column_width=True)
             else:
-                st.write("Preview unavailable")
+                st.write("STEP preview unavailable")
         with cols[1]:
             st.markdown(f"**{rel}**")
             if distance_metric.startswith("Cosine"):
@@ -621,46 +694,46 @@ def main():
         layout="wide",
     )
     st.title("3D Mesh Similarity Search")
-    st.caption(f"Data directory: {DATA_DIR}")
+    st.caption(f"STL directory: {DATA_DIR} | STEP directory: {STEP_DATA_DIR}")
     with st.expander("Quick start", expanded=True):
         st.markdown(
             """
-            1. Put your `.stl` files inside the `data/` folder at the project root.
+            1. Put your `.stl` files inside `data/`, or `.step` / `.stp` files inside `step_data/`.
             2. Choose an embedding backend in the sidebar.
             3. Build the index once, then run searches.
             """
         )
 
     backend, search_settings, distance_metric = _make_backend()
-    mesh_paths, rel_paths = _load_mesh_list()
+    data_paths, rel_paths, active_data_dir, active_file_label = _load_data_list(backend)
 
-    if not mesh_paths:
-        st.error("No `.stl` files found in the data directory.")
+    if not data_paths:
+        st.error(f"No `{active_file_label}` files found in {active_data_dir}.")
         st.markdown(
-            "Create `data/` at the project root and place STL files inside it."
+            "Create the folder at the project root and place files inside it."
         )
         return
 
     st.sidebar.header("Project Status")
-    st.sidebar.write(f"Meshes found: {len(mesh_paths)}")
+    st.sidebar.write(f"{active_file_label} files found: {len(data_paths)}")
     embeddings, stored_paths, meta, stale, mean, std = load_index(
-        INDEX_DIR, backend, mesh_paths
+        INDEX_DIR, backend, data_paths
     )
 
     if stale:
         st.sidebar.warning("Index missing or out of date.")
         if st.sidebar.button("Build / Rebuild index"):
             with st.spinner("Building index..."):
-                meta = _build_index_with_progress(backend, mesh_paths)
+                meta = _build_index_with_progress(backend, data_paths)
             embeddings, stored_paths, meta, stale, mean, std = load_index(
-                INDEX_DIR, backend, mesh_paths
+                INDEX_DIR, backend, data_paths
             )
     else:
         if meta and "count" in meta:
             st.sidebar.write(
                 f"Index ready: {meta.get('count')} items, dim {meta.get('dim')}"
             )
-            if meta.get("count", 0) < len(mesh_paths):
+            if meta.get("count", 0) < len(data_paths):
                 st.sidebar.warning("Index is partial (some meshes failed to embed).")
 
     if embeddings is None or stale:
@@ -675,7 +748,9 @@ def main():
     if show_3d and go is None:
         st.warning("3D previews require Plotly. Install with `pip install plotly`.")
         show_3d = False
-    query_modes = ["Choose from dataset", "Upload STL", "RAG product agent"]
+    query_modes = ["Choose from dataset", "RAG product agent"]
+    if not hasattr(backend, "embed_path"):
+        query_modes.insert(1, "Upload STL")
     query_mode = st.radio("Query type", query_modes)
     query_mesh = None
     query_path = None
@@ -683,17 +758,20 @@ def main():
     uploaded_text = ""
 
     if query_mode == "Choose from dataset":
-        selection = st.selectbox("Select a mesh", rel_paths)
-        query_path = DATA_DIR / selection
-        try:
-            query_mesh = load_mesh(query_path)
-            if show_3d:
-                _render_3d(query_mesh, f"Query: {selection}")
-            else:
-                _render_preview(query_mesh, f"Query: {selection}")
-        except Exception as exc:
-            st.error(f"Failed to load query mesh: {exc}")
-            return
+        selection = st.selectbox(f"Select a {active_file_label} file", rel_paths)
+        query_path = active_data_dir / selection
+        if hasattr(backend, "embed_path"):
+            st.write(f"Query file: `{selection}`")
+        else:
+            try:
+                query_mesh = load_mesh(query_path)
+                if show_3d:
+                    _render_3d(query_mesh, f"Query: {selection}")
+                else:
+                    _render_preview(query_mesh, f"Query: {selection}")
+            except Exception as exc:
+                st.error(f"Failed to load query mesh: {exc}")
+                return
     elif query_mode == "Upload STL":
         st.info("Upload mode always returns the top 5 most similar results.")
         upload = st.file_uploader("Upload STL", type=["stl"])
@@ -710,7 +788,7 @@ def main():
     else:
         if not hasattr(backend, "embed_text"):
             st.warning(
-                "The RAG product agent needs a text-capable backend. Use Gemini or BERT, "
+                "The RAG product agent needs a text-capable backend. Use Gemini, BERT, BRepMAE, or CADGCL, "
                 "then build the index for that backend."
             )
         st.markdown("Upload product notes/specs and ask for the kind of item you want to find.")
@@ -761,15 +839,18 @@ def main():
                     distance_metric,
                     top_k,
                 )
-            _render_results(results, stored_paths, distance_metric, show_3d)
+            _render_results(results, stored_paths, active_data_dir, distance_metric, show_3d)
             return
 
-        if query_mesh is None:
+        if query_mesh is None and query_path is None:
             st.error("Provide a query mesh first.")
             return
 
         with st.spinner("Embedding query and searching..."):
-            query_emb = backend.embed_mesh(query_mesh)
+            if hasattr(backend, "embed_path") and query_path is not None:
+                query_emb = backend.embed_path(query_path)
+            else:
+                query_emb = backend.embed_mesh(query_mesh)
             results = _search_index(
                 query_emb,
                 embeddings,
@@ -791,7 +872,7 @@ def main():
         else:
             results = results[:top_k]
 
-        _render_results(results, stored_paths, distance_metric, show_3d)
+        _render_results(results, stored_paths, active_data_dir, distance_metric, show_3d)
 
 
 if __name__ == "__main__":

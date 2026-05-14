@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from .base import EmbeddingBackend
 from .bert import BertEmbeddingBackend
+from .brep import BRepMAEEmbeddingBackend, CADGCLEmbeddingBackend
 from .experimental import (
     AutoencoderLatentEmbeddingBackend,
     GraphSpectralEmbeddingBackend,
@@ -18,6 +19,8 @@ from .local import LocalEmbeddingBackend
 __all__ = [
     "AutoencoderLatentEmbeddingBackend",
     "BertEmbeddingBackend",
+    "BRepMAEEmbeddingBackend",
+    "CADGCLEmbeddingBackend",
     "EmbeddingBackend",
     "GeminiEmbeddingBackend",
     "GraphSpectralEmbeddingBackend",

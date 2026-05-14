@@ -12,6 +12,11 @@ def list_mesh_files(data_dir: Path) -> List[Path]:
     return sorted(Path(data_dir).rglob("*.stl"))
 
 
+def list_step_files(data_dir: Path) -> List[Path]:
+    extensions = {".step", ".stp"}
+    return sorted(p for p in Path(data_dir).rglob("*") if p.suffix.lower() in extensions)
+
+
 def load_mesh(path: Path) -> trimesh.Trimesh:
     mesh = trimesh.load(path, force="mesh")
     if isinstance(mesh, trimesh.Scene):

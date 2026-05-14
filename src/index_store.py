@@ -90,11 +90,14 @@ def build_index(
     total = len(data_paths)
     for i, path in enumerate(data_paths, start=1):
         try:
-            mesh = load_mesh(path)
-            if hasattr(backend, "embed_mesh_with_context"):
-                emb = backend.embed_mesh_with_context(mesh, _path_context(path))
+            if hasattr(backend, "embed_path"):
+                emb = backend.embed_path(path)
             else:
-                emb = backend.embed_mesh(mesh)
+                mesh = load_mesh(path)
+                if hasattr(backend, "embed_mesh_with_context"):
+                    emb = backend.embed_mesh_with_context(mesh, _path_context(path))
+                else:
+                    emb = backend.embed_mesh(mesh)
             embeddings.append(emb)
             stored_paths.append(str(path))
         except Exception as exc:
