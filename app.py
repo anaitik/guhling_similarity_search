@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 from typing import List, Tuple
 
+import numpy as np
 import streamlit as st
 try:
     import plotly.graph_objects as go
@@ -526,12 +527,128 @@ def _render_preview(mesh, caption: str):
     st.image(img, caption=caption, use_column_width=True)
 
 
-def _mesh_to_plotly(mesh, title: str):
+def _viewer_settings():
+    with st.expander("3D viewer settings", expanded=False):
+        cols = st.columns(3)
+        with cols[0]:
+            color_mode = st.selectbox(
+                "Surface",
+                ["Solid", "Height gradient"],
+                index=0,
+            )
+            color = st.color_picker("Solid color", "#7da0c4")
+        with cols[1]:
+            view = st.selectbox(
+                "Camera",
+                ["Isometric", "Front", "Top", "Right"],
+                index=0,
+            )
+            height = st.slider("Viewer height", 260, 720, 420, step=20)
+        with cols[2]:
+            show_axes = st.checkbox("Axes", value=False)
+            show_bounds = st.checkbox("Bounds", value=True)
+            flatshading = st.checkbox("Flat shading", value=True)
+    return {
+        "color_mode": color_mode,
+        "color": color,
+        "view": view,
+        "height": height,
+        "show_axes": show_axes,
+        "show_bounds": show_bounds,
+        "flatshading": flatshading,
+    }
+
+
+def _camera_for_view(view: str):
+    cameras = {
+        "Front": dict(x=0.0, y=-2.2, z=0.25),
+        "Top": dict(x=0.0, y=0.0, z=2.4),
+        "Right": dict(x=2.2, y=0.0, z=0.25),
+        "Isometric": dict(x=1.55, y=-1.75, z=1.25),
+    }
+    return dict(eye=cameras.get(view, cameras["Isometric"]))
+
+
+def _bbox_trace(vertices: np.ndarray):
+    mins = vertices.min(axis=0)
+    maxs = vertices.max(axis=0)
+    corners = np.array(
+        [
+            [mins[0], mins[1], mins[2]],
+            [maxs[0], mins[1], mins[2]],
+            [maxs[0], maxs[1], mins[2]],
+            [mins[0], maxs[1], mins[2]],
+            [mins[0], mins[1], maxs[2]],
+            [maxs[0], mins[1], maxs[2]],
+            [maxs[0], maxs[1], maxs[2]],
+            [mins[0], maxs[1], maxs[2]],
+        ]
+    )
+    edges = [
+        (0, 1), (1, 2), (2, 3), (3, 0),
+        (4, 5), (5, 6), (6, 7), (7, 4),
+        (0, 4), (1, 5), (2, 6), (3, 7),
+    ]
+    x, y, z = [], [], []
+    for start, end in edges:
+        x.extend([corners[start, 0], corners[end, 0], None])
+        y.extend([corners[start, 1], corners[end, 1], None])
+        z.extend([corners[start, 2], corners[end, 2], None])
+    return go.Scatter3d(
+        x=x,
+        y=y,
+        z=z,
+        mode="lines",
+        line=dict(color="rgba(40, 45, 55, 0.45)", width=3),
+        hoverinfo="skip",
+        showlegend=False,
+    )
+
+
+def _axis_traces(vertices: np.ndarray):
+    mins = vertices.min(axis=0)
+    maxs = vertices.max(axis=0)
+    center = (mins + maxs) / 2.0
+    radius = float(np.max(maxs - mins)) * 0.58 or 1.0
+    axes = [
+        ("X", np.array([radius, 0.0, 0.0]), "#d1495b"),
+        ("Y", np.array([0.0, radius, 0.0]), "#2a9d8f"),
+        ("Z", np.array([0.0, 0.0, radius]), "#277da1"),
+    ]
+    traces = []
+    for name, vector, color in axes:
+        end = center + vector
+        traces.append(
+            go.Scatter3d(
+                x=[center[0], end[0]],
+                y=[center[1], end[1]],
+                z=[center[2], end[2]],
+                mode="lines+text",
+                text=["", name],
+                textposition="top center",
+                line=dict(color=color, width=5),
+                hoverinfo="skip",
+                showlegend=False,
+            )
+        )
+    return traces
+
+
+def _mesh_stats(mesh) -> str:
+    extents = mesh.extents if mesh.extents is not None else np.zeros(3)
+    return (
+        f"{len(mesh.vertices):,} vertices | {len(mesh.faces):,} faces | "
+        f"size {extents[0]:.2f} x {extents[1]:.2f} x {extents[2]:.2f}"
+    )
+
+
+def _mesh_to_plotly(mesh, title: str, viewer_settings=None):
     if go is None:
         raise RuntimeError("Plotly is not installed.")
     if mesh.faces is None or mesh.faces.size == 0:
         raise ValueError("Mesh has no faces.")
 
+    viewer_settings = viewer_settings or {}
     vertices = mesh.vertices
     faces = mesh.faces
 
@@ -543,36 +660,91 @@ def _mesh_to_plotly(mesh, title: str):
     x, y, z = vertices.T
     i, j, k = faces.T
 
+    mesh_kwargs = {
+        "x": x,
+        "y": y,
+        "z": z,
+        "i": i,
+        "j": j,
+        "k": k,
+        "opacity": 1.0,
+        "flatshading": viewer_settings.get("flatshading", True),
+        "lighting": dict(
+            ambient=0.34,
+            diffuse=0.78,
+            specular=0.28,
+            roughness=0.72,
+            fresnel=0.12,
+        ),
+        "lightposition": dict(x=100, y=-140, z=180),
+        "hovertemplate": "x: %{x:.3f}<br>y: %{y:.3f}<br>z: %{z:.3f}<extra></extra>",
+    }
+    if viewer_settings.get("color_mode") == "Height gradient":
+        mesh_kwargs.update(
+            intensity=z,
+            colorscale="Viridis",
+            showscale=False,
+        )
+    else:
+        mesh_kwargs["color"] = viewer_settings.get("color", "#7da0c4")
+
+    data = [go.Mesh3d(**mesh_kwargs)]
+    if viewer_settings.get("show_bounds", True):
+        data.append(_bbox_trace(vertices))
+    if viewer_settings.get("show_axes", False):
+        data.extend(_axis_traces(vertices))
+
     fig = go.Figure(
-        data=[
-            go.Mesh3d(
-                x=x,
-                y=y,
-                z=z,
-                i=i,
-                j=j,
-                k=k,
-                color="#7da0c4",
-                opacity=1.0,
-                flatshading=True,
-            )
-        ]
+        data=data
     )
     fig.update_layout(
         title=title,
+        height=viewer_settings.get("height", 420),
         scene_aspectmode="data",
         scene=dict(
-            xaxis=dict(visible=False),
-            yaxis=dict(visible=False),
-            zaxis=dict(visible=False),
+            camera=_camera_for_view(viewer_settings.get("view", "Isometric")),
+            xaxis=dict(
+                visible=viewer_settings.get("show_axes", False),
+                showbackground=False,
+                showgrid=True,
+                zeroline=False,
+                title="X",
+            ),
+            yaxis=dict(
+                visible=viewer_settings.get("show_axes", False),
+                showbackground=False,
+                showgrid=True,
+                zeroline=False,
+                title="Y",
+            ),
+            zaxis=dict(
+                visible=viewer_settings.get("show_axes", False),
+                showbackground=False,
+                showgrid=True,
+                zeroline=False,
+                title="Z",
+            ),
         ),
-        margin=dict(l=0, r=0, t=30, b=0),
+        margin=dict(l=0, r=0, t=36, b=0),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        uirevision=title,
     )
     return fig
 
-def _render_3d(mesh, title: str):
-    fig = _mesh_to_plotly(mesh, title)
-    st.plotly_chart(fig, use_container_width=True)
+def _render_3d(mesh, title: str, viewer_settings=None):
+    fig = _mesh_to_plotly(mesh, title, viewer_settings)
+    st.caption(_mesh_stats(mesh))
+    st.plotly_chart(
+        fig,
+        use_container_width=True,
+        config={
+            "displaylogo": False,
+            "scrollZoom": True,
+            "responsive": True,
+            "modeBarButtonsToAdd": ["resetCameraDefault3d"],
+        },
+    )
 
 
 @st.cache_data(show_spinner=False)
@@ -705,7 +877,14 @@ def _search_index(
     return top_k_l2(query_p, embeddings_p, top_k)
 
 
-def _render_results(results, stored_paths, data_dir: Path, distance_metric: str, show_3d: bool):
+def _render_results(
+    results,
+    stored_paths,
+    data_dir: Path,
+    distance_metric: str,
+    show_3d: bool,
+    viewer_settings=None,
+):
     st.subheader("Results")
     for idx, score in results:
         path = Path(stored_paths[idx])
@@ -723,12 +902,12 @@ def _render_results(results, stored_paths, data_dir: Path, distance_metric: str,
             score_display = min(max(score, -1.0), 1.0)
             distance = 1.0 - score_display
 
-        cols = st.columns([1, 3])
+        cols = st.columns([2, 3] if show_3d else [1, 3])
         with cols[0]:
             if mesh is not None:
                 if show_3d:
                     try:
-                        _render_3d(mesh, title)
+                        _render_3d(mesh, title, viewer_settings)
                     except Exception:
                         img = mesh_preview_png(mesh, points=PREVIEW_POINTS)
                         st.image(img, use_column_width=True)
@@ -816,6 +995,7 @@ def main():
     if show_3d and go is None:
         st.warning("3D previews require Plotly. Install with `pip install plotly`.")
         show_3d = False
+    viewer_settings = _viewer_settings() if show_3d else None
     upload_mode = "Upload STEP/STP" if hasattr(backend, "embed_path") else "Upload STL"
     query_modes = ["Choose from dataset", upload_mode, "RAG product agent"]
     query_mode = st.radio("Query type", query_modes)
@@ -843,6 +1023,7 @@ def main():
                         _render_3d(
                             query_mesh,
                             f"Query: {_format_data_option(active_data_dir, selection, active_file_label)}",
+                            viewer_settings,
                         )
                     else:
                         _render_preview(
@@ -858,6 +1039,7 @@ def main():
                     _render_3d(
                         query_mesh,
                         f"Query: {_format_data_option(active_data_dir, selection, active_file_label)}",
+                        viewer_settings,
                     )
                 else:
                     _render_preview(
@@ -884,7 +1066,11 @@ def main():
                 try:
                     query_mesh = _load_preview_mesh(query_upload_path)
                     if show_3d:
-                        _render_3d(query_mesh, f"Query (uploaded): {upload.name}")
+                        _render_3d(
+                            query_mesh,
+                            f"Query (uploaded): {upload.name}",
+                            viewer_settings,
+                        )
                     else:
                         _render_preview(query_mesh, f"Query (uploaded): {upload.name}")
                 except Exception as exc:
@@ -893,7 +1079,11 @@ def main():
                 try:
                     query_mesh = load_mesh_from_bytes(upload.getvalue())
                     if show_3d:
-                        _render_3d(query_mesh, f"Query (uploaded): {upload.name}")
+                        _render_3d(
+                            query_mesh,
+                            f"Query (uploaded): {upload.name}",
+                            viewer_settings,
+                        )
                     else:
                         _render_preview(query_mesh, f"Query (uploaded): {upload.name}")
                 except Exception as exc:
@@ -953,7 +1143,14 @@ def main():
                     distance_metric,
                     top_k,
                 )
-            _render_results(results, stored_paths, active_data_dir, distance_metric, show_3d)
+            _render_results(
+                results,
+                stored_paths,
+                active_data_dir,
+                distance_metric,
+                show_3d,
+                viewer_settings,
+            )
             return
 
         if query_mesh is None and query_path is None and query_upload_path is None:
@@ -988,7 +1185,14 @@ def main():
         else:
             results = results[:top_k]
 
-        _render_results(results, stored_paths, active_data_dir, distance_metric, show_3d)
+        _render_results(
+            results,
+            stored_paths,
+            active_data_dir,
+            distance_metric,
+            show_3d,
+            viewer_settings,
+        )
 
 
 if __name__ == "__main__":
