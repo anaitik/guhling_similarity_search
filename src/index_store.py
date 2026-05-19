@@ -7,7 +7,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
-from .data_loader import load_mesh
+from .data_loader import load_mesh, parse_mesh_filename
 
 
 def _index_files(index_dir: Path, backend_name: str) -> Dict[str, Path]:
@@ -21,12 +21,19 @@ def _index_files(index_dir: Path, backend_name: str) -> Dict[str, Path]:
 
 
 def _path_context(path: Path) -> str:
+    meta = parse_mesh_filename(path)
     parts = []
+    if meta.get("part_number"):
+        parts.append(f"part number {meta['part_number']}")
+    if meta.get("value"):
+        parts.append(f"value {meta['value']}")
+
     for item in [path.parent.name, path.stem]:
+        if item == path.anchor or item.lower() == "data":
+            continue
         cleaned = (
             item.replace("_", " ")
             .replace("-", " ")
-            .replace(".", " ")
             .strip()
         )
         if cleaned:
@@ -62,7 +69,18 @@ def load_index(
     current_paths = [str(p) for p in data_paths]
     current_set = set(current_paths)
     stored_set = set(stored_paths)
+
     if not stored_set.issubset(current_set):
+        return None, None, {"status": "paths_mismatch", "meta": meta}, True, None, None
+
+    error_paths = {
+        str(error.get("path"))
+        for error in meta.get("errors", [])
+        if isinstance(error, dict) and error.get("path")
+    }
+    missing_paths = current_set - stored_set
+    new_paths = missing_paths - error_paths
+    if new_paths:
         return None, None, {"status": "paths_mismatch", "meta": meta}, True, None, None
 
     if not files["mean"].exists() or not files["std"].exists():

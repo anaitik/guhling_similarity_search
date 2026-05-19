@@ -45,7 +45,7 @@ build/
 data/
 index/
 .cache/
-
+step-data/
 # Streamlit files
 streamlit.err.log
 streamlit.out.log

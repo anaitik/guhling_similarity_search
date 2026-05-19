@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 from pathlib import Path
 from typing import List, Tuple
@@ -34,7 +35,15 @@ from src.config import (
     STEP_DATA_DIR,
     TOPO_WEIGHT,
 )
-from src.data_loader import list_mesh_files, list_step_files, load_mesh, load_mesh_from_bytes
+from src.data_loader import (
+    list_mesh_files,
+    list_step_files,
+    load_mesh,
+    load_mesh_from_bytes,
+    load_step_mesh,
+    mesh_display_name,
+    parse_mesh_filename,
+)
 from src.embedding_backends import (
     AutoencoderLatentEmbeddingBackend,
     BertEmbeddingBackend,
@@ -498,6 +507,20 @@ def _load_data_list(backend) -> Tuple[List[Path], List[str], Path, str]:
     return paths, rel_paths, data_dir, label
 
 
+def _format_data_option(data_dir: Path, rel_path: str, label: str) -> str:
+    path = data_dir / rel_path
+    if label in {"STL", "STEP/STP"}:
+        return mesh_display_name(path)
+    return rel_path
+
+
+def _result_title(path: Path, data_dir: Path) -> str:
+    rel = path.relative_to(data_dir)
+    if path.suffix.lower() in {".stl", ".step", ".stp"}:
+        return mesh_display_name(path)
+    return str(rel)
+
+
 def _render_preview(mesh, caption: str):
     img = mesh_preview_png(mesh, points=PREVIEW_POINTS)
     st.image(img, caption=caption, use_column_width=True)
@@ -550,6 +573,39 @@ def _mesh_to_plotly(mesh, title: str):
 def _render_3d(mesh, title: str):
     fig = _mesh_to_plotly(mesh, title)
     st.plotly_chart(fig, use_container_width=True)
+
+
+@st.cache_data(show_spinner=False)
+def _load_step_preview_mesh(path_text: str):
+    return load_step_mesh(Path(path_text))
+
+
+def _load_preview_mesh(path: Path):
+    suffix = path.suffix.lower()
+    if suffix == ".stl":
+        return load_mesh(path)
+    if suffix in {".step", ".stp"}:
+        return _load_step_preview_mesh(str(path))
+    return None
+
+
+def _store_uploaded_query_file(upload, allowed_extensions) -> Path:
+    suffix = Path(upload.name).suffix.lower()
+    if suffix not in allowed_extensions:
+        expected = ", ".join(sorted(allowed_extensions))
+        raise ValueError(f"Expected one of: {expected}")
+
+    data = upload.getvalue()
+    digest = hashlib.sha256(data).hexdigest()[:16]
+    safe_stem = "".join(
+        ch if ch.isalnum() or ch in {" ", "_", "-"} else "_"
+        for ch in Path(upload.name).stem
+    ).strip() or "uploaded_query"
+    upload_dir = INDEX_DIR / "uploaded_queries"
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    path = upload_dir / f"{safe_stem}_{digest}{suffix}"
+    path.write_bytes(data)
+    return path
 
 
 def _build_index_with_progress(backend, mesh_paths: List[Path]):
@@ -654,10 +710,14 @@ def _render_results(results, stored_paths, data_dir: Path, distance_metric: str,
     for idx, score in results:
         path = Path(stored_paths[idx])
         rel = path.relative_to(data_dir)
+        title = _result_title(path, data_dir)
         try:
-            mesh = load_mesh(path) if path.suffix.lower() == ".stl" else None
-        except Exception:
+            mesh = _load_preview_mesh(path)
+        except Exception as exc:
             mesh = None
+            preview_error = str(exc)
+        else:
+            preview_error = ""
 
         if distance_metric.startswith("Cosine"):
             score_display = min(max(score, -1.0), 1.0)
@@ -668,7 +728,7 @@ def _render_results(results, stored_paths, data_dir: Path, distance_metric: str,
             if mesh is not None:
                 if show_3d:
                     try:
-                        _render_3d(mesh, f"{rel}")
+                        _render_3d(mesh, title)
                     except Exception:
                         img = mesh_preview_png(mesh, points=PREVIEW_POINTS)
                         st.image(img, use_column_width=True)
@@ -676,9 +736,17 @@ def _render_results(results, stored_paths, data_dir: Path, distance_metric: str,
                     img = mesh_preview_png(mesh, points=PREVIEW_POINTS)
                     st.image(img, use_column_width=True)
             else:
-                st.write("STEP preview unavailable")
+                st.write("Preview unavailable")
+                if preview_error:
+                    st.caption(preview_error)
         with cols[1]:
-            st.markdown(f"**{rel}**")
+            st.markdown(f"**{title}**")
+            if path.suffix.lower() in {".stl", ".step", ".stp"}:
+                meta = parse_mesh_filename(path)
+                if meta.get("part_number") and meta.get("value"):
+                    st.write(f"Part number: `{meta['part_number']}`")
+                    st.write(f"Value: `{meta['value']}`")
+            st.caption(str(rel))
             if distance_metric.startswith("Cosine"):
                 st.write(f"Similarity (cosine): {score_display:.6f}")
                 st.write(f"Cosine distance: {distance:.6f}")
@@ -742,49 +810,95 @@ def main():
 
     st.subheader("Search")
     st.markdown(
-        "Choose a query mesh, upload a new STL, or use the RAG product agent to search from text/files."
+        "Choose a query file, upload a new part, or use the RAG product agent to search from text/files."
     )
     show_3d = st.checkbox("Show 3D previews", value=False)
     if show_3d and go is None:
         st.warning("3D previews require Plotly. Install with `pip install plotly`.")
         show_3d = False
-    query_modes = ["Choose from dataset", "RAG product agent"]
-    if not hasattr(backend, "embed_path"):
-        query_modes.insert(1, "Upload STL")
+    upload_mode = "Upload STEP/STP" if hasattr(backend, "embed_path") else "Upload STL"
+    query_modes = ["Choose from dataset", upload_mode, "RAG product agent"]
     query_mode = st.radio("Query type", query_modes)
     query_mesh = None
     query_path = None
+    query_upload_path = None
     text_query = ""
     uploaded_text = ""
 
     if query_mode == "Choose from dataset":
-        selection = st.selectbox(f"Select a {active_file_label} file", rel_paths)
+        selection = st.selectbox(
+            f"Select a {active_file_label} file",
+            rel_paths,
+            format_func=lambda rel: _format_data_option(
+                active_data_dir, rel, active_file_label
+            ),
+        )
         query_path = active_data_dir / selection
         if hasattr(backend, "embed_path"):
             st.write(f"Query file: `{selection}`")
+            try:
+                query_mesh = _load_preview_mesh(query_path)
+                if query_mesh is not None:
+                    if show_3d:
+                        _render_3d(
+                            query_mesh,
+                            f"Query: {_format_data_option(active_data_dir, selection, active_file_label)}",
+                        )
+                    else:
+                        _render_preview(
+                            query_mesh,
+                            f"Query: {_format_data_option(active_data_dir, selection, active_file_label)}",
+                        )
+            except Exception as exc:
+                st.warning(f"STEP preview unavailable: {exc}")
         else:
             try:
                 query_mesh = load_mesh(query_path)
                 if show_3d:
-                    _render_3d(query_mesh, f"Query: {selection}")
+                    _render_3d(
+                        query_mesh,
+                        f"Query: {_format_data_option(active_data_dir, selection, active_file_label)}",
+                    )
                 else:
-                    _render_preview(query_mesh, f"Query: {selection}")
+                    _render_preview(
+                        query_mesh,
+                        f"Query: {_format_data_option(active_data_dir, selection, active_file_label)}",
+                    )
             except Exception as exc:
                 st.error(f"Failed to load query mesh: {exc}")
                 return
-    elif query_mode == "Upload STL":
+    elif query_mode == upload_mode:
         st.info("Upload mode always returns the top 5 most similar results.")
-        upload = st.file_uploader("Upload STL", type=["stl"])
+        upload_types = ["step", "stp"] if hasattr(backend, "embed_path") else ["stl"]
+        upload = st.file_uploader(f"Upload {active_file_label}", type=upload_types)
         if upload is not None:
-            try:
-                query_mesh = load_mesh_from_bytes(upload.read())
-                if show_3d:
-                    _render_3d(query_mesh, "Query (uploaded)")
-                else:
-                    _render_preview(query_mesh, "Query (uploaded)")
-            except Exception as exc:
-                st.error(f"Failed to load uploaded mesh: {exc}")
-                return
+            if hasattr(backend, "embed_path"):
+                try:
+                    query_upload_path = _store_uploaded_query_file(
+                        upload, {".step", ".stp"}
+                    )
+                except Exception as exc:
+                    st.error(f"Failed to save uploaded STEP file: {exc}")
+                    return
+
+                try:
+                    query_mesh = _load_preview_mesh(query_upload_path)
+                    if show_3d:
+                        _render_3d(query_mesh, f"Query (uploaded): {upload.name}")
+                    else:
+                        _render_preview(query_mesh, f"Query (uploaded): {upload.name}")
+                except Exception as exc:
+                    st.warning(f"STEP preview unavailable: {exc}")
+            else:
+                try:
+                    query_mesh = load_mesh_from_bytes(upload.getvalue())
+                    if show_3d:
+                        _render_3d(query_mesh, f"Query (uploaded): {upload.name}")
+                    else:
+                        _render_preview(query_mesh, f"Query (uploaded): {upload.name}")
+                except Exception as exc:
+                    st.error(f"Failed to load uploaded STL file: {exc}")
+                    return
     else:
         if not hasattr(backend, "embed_text"):
             st.warning(
@@ -811,7 +925,7 @@ def main():
                 st.text(uploaded_text[:5000])
 
     top_k = None
-    if query_mode == "Upload STL":
+    if query_mode == upload_mode:
         top_k = 5
         st.info("Upload mode returns the top 5 most similar results.")
     else:
@@ -842,13 +956,15 @@ def main():
             _render_results(results, stored_paths, active_data_dir, distance_metric, show_3d)
             return
 
-        if query_mesh is None and query_path is None:
-            st.error("Provide a query mesh first.")
+        if query_mesh is None and query_path is None and query_upload_path is None:
+            st.error("Provide a query file first.")
             return
 
         with st.spinner("Embedding query and searching..."):
-            if hasattr(backend, "embed_path") and query_path is not None:
-                query_emb = backend.embed_path(query_path)
+            if hasattr(backend, "embed_path") and (
+                query_path is not None or query_upload_path is not None
+            ):
+                query_emb = backend.embed_path(query_upload_path or query_path)
             else:
                 query_emb = backend.embed_mesh(query_mesh)
             results = _search_index(
