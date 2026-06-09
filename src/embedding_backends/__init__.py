@@ -3,6 +3,7 @@ from __future__ import annotations
 from .base import EmbeddingBackend
 from .bert import BertEmbeddingBackend
 from .brep import BRepMAEEmbeddingBackend, CADGCLEmbeddingBackend
+from .deepseek import DeepSeekEmbeddingBackend
 from .experimental import (
     AutoencoderLatentEmbeddingBackend,
     GraphSpectralEmbeddingBackend,
@@ -13,7 +14,6 @@ from .experimental import (
     SemanticProfileEmbeddingBackend,
     VoxelEmbeddingBackend,
 )
-from .gemini import GeminiEmbeddingBackend
 from .local import LocalEmbeddingBackend
 
 __all__ = [
@@ -21,8 +21,8 @@ __all__ = [
     "BertEmbeddingBackend",
     "BRepMAEEmbeddingBackend",
     "CADGCLEmbeddingBackend",
+    "DeepSeekEmbeddingBackend",
     "EmbeddingBackend",
-    "GeminiEmbeddingBackend",
     "GraphSpectralEmbeddingBackend",
     "HybridEmbeddingBackend",
     "LocalEmbeddingBackend",

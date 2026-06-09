@@ -18,15 +18,18 @@ from src.config import (
     BERT_SAMPLE_POINTS,
     DATA_DIR,
     DEFAULT_BERT_MODEL,
-    DEFAULT_GEMINI_MODEL,
+    DEFAULT_DEEPSEEK_BASE_URL,
+    DEFAULT_DEEPSEEK_MODEL,
     D2_BINS,
     D2_PAIRS,
     D2_WEIGHT,
+    DEEPSEEK_API_KEY_ENV,
     EXTENT_WEIGHT,
-    GEMINI_API_KEY_ENV,
     INCLUDE_SCALE,
     INDEX_DIR,
     LOG_FEATURES,
+    MAX_INDEX_MESH_BYTES,
+    MAX_INDEX_MESH_MB,
     POINTS,
     PREVIEW_POINTS,
     RADIAL_BINS,
@@ -50,7 +53,7 @@ from src.embedding_backends import (
     BertEmbeddingBackend,
     BRepMAEEmbeddingBackend,
     CADGCLEmbeddingBackend,
-    GeminiEmbeddingBackend,
+    DeepSeekEmbeddingBackend,
     GraphSpectralEmbeddingBackend,
     HybridEmbeddingBackend,
     LocalEmbeddingBackend,
@@ -60,7 +63,11 @@ from src.embedding_backends import (
     SemanticProfileEmbeddingBackend,
     VoxelEmbeddingBackend,
 )
-from src.index_store import build_index, load_index
+from src.index_store import (
+    build_hybrid_index_from_component_indexes,
+    build_index,
+    load_index,
+)
 from src.preview import mesh_preview_png
 from src.similarity import (
     build_weight_vector,
@@ -127,11 +134,27 @@ BACKEND_DESCRIPTIONS = {
         "Uses handcrafted radial and point-pair distance histograms plus size, extent, "
         "and topology features. Fast, explainable, and fully offline."
     ),
-    "Gemini (API, slower/costs)": (
-        "Converts mesh geometry into text and sends it to Gemini embeddings, then "
-        "searches using the returned API embedding vectors."
+    "DeepSeek (API, semantic vector)": (
+        "Converts mesh geometry into text, asks DeepSeek for a fixed semantic vector, "
+        "then searches using those API-generated vectors."
     ),
 }
+
+
+def _default_hybrid_component_backends():
+    return [
+        GraphSpectralEmbeddingBackend(eigen_count=32, max_vertices=300),
+        VoxelEmbeddingBackend(resolution=12, points=2048),
+        PointCloudEmbeddingBackend(points=1024, bins=24),
+        MultiViewProjectionEmbeddingBackend(points=2048, image_bins=16),
+        PartFeatureEmbeddingBackend(),
+        SemanticProfileEmbeddingBackend(points=1024),
+        AutoencoderLatentEmbeddingBackend(
+            resolution=12,
+            latent_dim=64,
+            points=2048,
+        ),
+    ]
 
 
 def _make_backend():
@@ -150,7 +173,7 @@ def _make_backend():
             "Experimental: part features",
             "Experimental: autoencoder latent",
             "Local shape features (fast, offline)",
-            "Gemini (API, slower/costs)",
+            "DeepSeek (API, semantic vector)",
         ],
     )
     st.sidebar.info(BACKEND_DESCRIPTIONS[backend_choice])
@@ -174,15 +197,7 @@ def _make_backend():
             if include_bert:
                 bert_weight = st.slider("BERT weight", 0.0, 3.0, 0.5, step=0.1)
 
-        backends = [
-            GraphSpectralEmbeddingBackend(),
-            VoxelEmbeddingBackend(),
-            PointCloudEmbeddingBackend(),
-            MultiViewProjectionEmbeddingBackend(),
-            PartFeatureEmbeddingBackend(),
-            SemanticProfileEmbeddingBackend(),
-            AutoencoderLatentEmbeddingBackend(),
-        ]
+        backends = _default_hybrid_component_backends()
         weights = [
             graph_weight,
             voxel_weight,
@@ -367,17 +382,22 @@ def _make_backend():
         )
         return backend, None, distance_metric
 
-    if backend_choice.startswith("Gemini"):
-        st.sidebar.warning("Gemini backend calls the API for each mesh (may cost).")
-        api_key = os.getenv(GEMINI_API_KEY_ENV, "")
+    if backend_choice.startswith("DeepSeek"):
+        st.sidebar.warning("DeepSeek backend calls the API for each mesh (may cost).")
+        api_key = os.getenv(DEEPSEEK_API_KEY_ENV, "")
         if not api_key:
-            api_key = st.sidebar.text_input("Gemini API key", type="password")
-        model = st.sidebar.text_input("Gemini embedding model", value=DEFAULT_GEMINI_MODEL)
+            api_key = st.sidebar.text_input("DeepSeek API key", type="password")
+        model = st.sidebar.text_input("DeepSeek model", value=DEFAULT_DEEPSEEK_MODEL)
+        base_url = st.sidebar.text_input("DeepSeek base URL", value=DEFAULT_DEEPSEEK_BASE_URL)
         if not api_key:
-            st.sidebar.error("Gemini key required to build embeddings.")
+            st.sidebar.error("DeepSeek key required to build embeddings.")
             st.stop()
         try:
-            backend = GeminiEmbeddingBackend(api_key=api_key, model=model)
+            backend = DeepSeekEmbeddingBackend(
+                api_key=api_key,
+                model=model,
+                base_url=base_url,
+            )
         except ImportError as exc:
             st.sidebar.error(str(exc))
             st.stop()
@@ -788,9 +808,64 @@ def _build_index_with_progress(backend, mesh_paths: List[Path]):
         progress.progress(min(i / total, 1.0))
         status.text(f"Indexing {i}/{total}")
 
-    meta = build_index(INDEX_DIR, backend, mesh_paths, progress_cb=_cb)
+    meta = None
+    if getattr(backend, "name", "") == "hybrid":
+        status.text("Checking cached component indexes...")
+        meta = build_hybrid_index_from_component_indexes(
+            INDEX_DIR, backend, mesh_paths, progress_cb=_cb
+        )
+    if meta is None:
+        meta = build_index(INDEX_DIR, backend, mesh_paths, progress_cb=_cb)
     status.text("Index ready")
     return meta
+
+
+def _build_all_local_method_indexes_with_progress(backend, mesh_paths: List[Path]):
+    methods = _default_hybrid_component_backends()
+    method_names = {method.name for method in methods}
+    for component in getattr(backend, "backends", []):
+        name = getattr(component, "name", component.__class__.__name__)
+        if name not in method_names:
+            methods.append(component)
+            method_names.add(name)
+
+    total_stages = len(methods) + 1
+    progress = st.progress(0.0)
+    status = st.empty()
+
+    for stage, method in enumerate(methods):
+        _, _, _, stale, _, _ = load_index(INDEX_DIR, method, mesh_paths)
+        if stale:
+            def _cb(i: int, total: int, stage=stage, method=method):
+                overall = (stage + (i / total)) / total_stages
+                progress.progress(min(overall, 1.0))
+                status.text(f"{method.name}: indexing {i}/{total}")
+
+            build_index(INDEX_DIR, method, mesh_paths, progress_cb=_cb)
+        else:
+            progress.progress(min((stage + 1) / total_stages, 1.0))
+            status.text(f"{method.name}: index already ready")
+
+    def _hybrid_cb(i: int, total: int):
+        overall = (len(methods) + (i / total)) / total_stages
+        progress.progress(min(overall, 1.0))
+        status.text(f"hybrid: combining cached embeddings {i}/{total}")
+
+    meta = build_hybrid_index_from_component_indexes(
+        INDEX_DIR, backend, mesh_paths, progress_cb=_hybrid_cb
+    )
+    if meta is None:
+        meta = build_index(INDEX_DIR, backend, mesh_paths, progress_cb=_hybrid_cb)
+    status.text("All local method indexes ready")
+    return meta
+
+
+def _is_oversized_mesh_query(path: Path, backend) -> bool:
+    return (
+        getattr(backend, "name", "") == "hybrid"
+        and path.suffix.lower() == ".stl"
+        and path.stat().st_size > MAX_INDEX_MESH_BYTES
+    )
 
 
 def _read_uploaded_text(files) -> str:
@@ -967,6 +1042,15 @@ def main():
         INDEX_DIR, backend, data_paths
     )
 
+    if getattr(backend, "name", "") == "hybrid" and st.sidebar.button(
+        "Build all local method indexes"
+    ):
+        with st.spinner("Building all local method indexes..."):
+            meta = _build_all_local_method_indexes_with_progress(backend, data_paths)
+        embeddings, stored_paths, meta, stale, mean, std = load_index(
+            INDEX_DIR, backend, data_paths
+        )
+
     if stale:
         st.sidebar.warning("Index missing or out of date.")
         if st.sidebar.button("Build / Rebuild index"):
@@ -1014,6 +1098,14 @@ def main():
             ),
         )
         query_path = active_data_dir / selection
+        if _is_oversized_mesh_query(query_path, backend):
+            size_mb = query_path.stat().st_size / 1024 / 1024
+            st.error(
+                f"This STL is {size_mb:.1f} MB, above the hybrid indexing limit "
+                f"of {MAX_INDEX_MESH_MB:g} MB. Raise MAX_INDEX_MESH_MB and rebuild "
+                "if you want to include it."
+            )
+            return
         if hasattr(backend, "embed_path"):
             st.write(f"Query file: `{selection}`")
             try:
@@ -1076,6 +1168,17 @@ def main():
                 except Exception as exc:
                     st.warning(f"STEP preview unavailable: {exc}")
             else:
+                upload_size = getattr(upload, "size", None)
+                if (
+                    getattr(backend, "name", "") == "hybrid"
+                    and upload_size is not None
+                    and upload_size > MAX_INDEX_MESH_BYTES
+                ):
+                    st.error(
+                        f"This uploaded STL is {upload_size / 1024 / 1024:.1f} MB, "
+                        f"above the hybrid limit of {MAX_INDEX_MESH_MB:g} MB."
+                    )
+                    return
                 try:
                     query_mesh = load_mesh_from_bytes(upload.getvalue())
                     if show_3d:
@@ -1092,7 +1195,7 @@ def main():
     else:
         if not hasattr(backend, "embed_text"):
             st.warning(
-                "The RAG product agent needs a text-capable backend. Use Gemini, BERT, BRepMAE, or CADGCL, "
+                "The RAG product agent needs a text-capable backend. Use DeepSeek, BERT, BRepMAE, or CADGCL, "
                 "then build the index for that backend."
             )
         st.markdown("Upload product notes/specs and ask for the kind of item you want to find.")
@@ -1125,7 +1228,7 @@ def main():
     if run:
         if query_mode == "RAG product agent":
             if not hasattr(backend, "embed_text"):
-                st.error("Switch to Gemini or BERT to search from text/files.")
+                st.error("Switch to DeepSeek or BERT to search from text/files.")
                 return
             if not text_query.strip() and not uploaded_text:
                 st.error("Describe the product or upload a product file first.")
