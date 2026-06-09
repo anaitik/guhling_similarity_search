@@ -24,16 +24,20 @@ def _unit_vector(vector: np.ndarray) -> np.ndarray:
 
 def _parse_vector(text: str) -> List[float]:
     text = text.strip()
+    if not text:
+        raise ValueError("DeepSeek response was empty")
     try:
         data = json.loads(text)
     except json.JSONDecodeError:
-        match = re.search(r"\[[\s\S]*\]", text)
+        match = re.search(r"\{[\s\S]*\}|\[[\s\S]*\]", text)
         if not match:
             raise ValueError("DeepSeek response did not include a JSON vector")
         data = json.loads(match.group(0))
 
+    if isinstance(data, dict):
+        data = data.get("vector")
     if not isinstance(data, list):
-        raise ValueError("DeepSeek response must be a JSON array")
+        raise ValueError("DeepSeek response must include a JSON vector array")
     if len(data) != VECTOR_DIM:
         raise ValueError(f"DeepSeek vector must have exactly {VECTOR_DIM} numbers")
     return [float(value) for value in data]
@@ -66,7 +70,9 @@ class DeepSeekEmbeddingBackend:
         prompt = (
             "Convert the following 3D mesh/product description into a deterministic "
             f"{self.vector_dim}-number semantic similarity vector. Return only a JSON "
-            "array of numbers from 0 to 1. Use the same dimensions every time, covering "
+            'object in this exact shape: {"vector": [0.1, 0.2, ...]}. The vector '
+            f"array must contain exactly {self.vector_dim} numbers from 0 to 1. "
+            "Use the same dimensions every time, covering "
             "shape proportions, flatness, elongation, roundness, hollowness, holes, "
             "mounting/bracket cues, handle/shaft cues, container/shell cues, mechanical "
             "complexity, symmetry, compactness, surface/detail complexity, and likely "
@@ -85,8 +91,10 @@ class DeepSeekEmbeddingBackend:
                 },
                 {"role": "user", "content": prompt},
             ],
+            response_format={"type": "json_object"},
             temperature=0,
             max_tokens=512,
+            extra_body={"thinking": {"type": "disabled"}},
             stream=False,
         )
         text = response.choices[0].message.content or ""

@@ -17,6 +17,7 @@ from src.config import (
     BERT_MAX_LENGTH,
     BERT_SAMPLE_POINTS,
     DATA_DIR,
+    DEEPSEEK_DATA_DIR,
     DEFAULT_BERT_MODEL,
     DEFAULT_DEEPSEEK_BASE_URL,
     DEFAULT_DEEPSEEK_MODEL,
@@ -136,9 +137,34 @@ BACKEND_DESCRIPTIONS = {
     ),
     "DeepSeek (API, semantic vector)": (
         "Converts mesh geometry into text, asks DeepSeek for a fixed semantic vector, "
-        "then searches using those API-generated vectors."
+        "then searches using those API-generated vectors. Uses only `deepseek_data/`."
     ),
 }
+
+MODEL_DESCRIPTION_PROMPT = """You are a 3D CAD geometry descriptor. Describe the model for similarity search, not for marketing.
+
+Create a concise geometric and functional description that can be embedded for RAG search. Focus on visible shape, proportions, topology, and likely mechanical affordances.
+
+Include:
+- overall form: flat, blocky, elongated, cylindrical, round, shell-like, plate-like, bracket-like, housing-like, handle-like, shaft-like, ring-like
+- proportions: compact vs long, thin vs thick, symmetric vs asymmetric
+- major features: holes, slots, cutouts, raised bosses, ribs, flanges, shafts, handles, threads, teeth, clips, mounting points
+- topology: open/closed, hollow/solid, watertight-looking, connected parts, repeated features
+- functional guess: mounting bracket, connector, spacer, knob, cover, handle, gear, fixture, container, adapter, support, etc.
+- search keywords that someone might type to find similar models
+
+Do not mention uncertainty too much. Do not describe color, material, lighting, camera angle, or file format unless it affects the geometry. Do not produce JSON.
+
+Output format:
+
+3D model description:
+{one compact paragraph}
+
+Geometry tags:
+{comma-separated tags}
+
+Search phrases:
+{5-10 short phrases someone could use to find this model}"""
 
 
 def _default_hybrid_component_backends():
@@ -383,7 +409,10 @@ def _make_backend():
         return backend, None, distance_metric
 
     if backend_choice.startswith("DeepSeek"):
-        st.sidebar.warning("DeepSeek backend calls the API for each mesh (may cost).")
+        st.sidebar.warning(
+            "DeepSeek calls the API for each indexed mesh. Put only the STL subset "
+            "you want to pay to embed in `deepseek_data/`."
+        )
         api_key = os.getenv(DEEPSEEK_API_KEY_ENV, "")
         if not api_key:
             api_key = st.sidebar.text_input("DeepSeek API key", type="password")
@@ -511,6 +540,8 @@ def _load_mesh_list() -> Tuple[List[Path], List[str]]:
 
 
 def _backend_data_dir(backend) -> Path:
+    if getattr(backend, "name", "") == "deepseek":
+        return DEEPSEEK_DATA_DIR
     if hasattr(backend, "embed_path"):
         return STEP_DATA_DIR
     return DATA_DIR
@@ -902,19 +933,51 @@ def _build_rag_query(user_text: str, file_context: str) -> str:
     ]
 
     parts = [
-        "3D mesh geometry descriptor search query.",
-        "Match indexed STL models by shape, function, proportions, topology, and visible product affordances.",
-        "Important geometry words: flat, elongated, compact, roundish, open, watertight, holes, base, shaft, ring, shell, bracket, handle, connector, mechanical.",
+        "3D model description:",
+        (
+            "Search for indexed 3D models by visible shape, proportions, topology, "
+            "and likely mechanical function. Prefer geometry and functional affordance "
+            "similarity over exact product names."
+        ),
     ]
-    if inferred_terms:
-        parts.append("Inferred product features: " + ", ".join(inferred_terms) + ".")
-    if file_context:
-        parts.append("Uploaded product notes:\n" + file_context[:30000])
     if user_text:
-        parts.append("User request:\n" + user_text.strip())
-    parts.append(
-        "Return closest 3D STL matches even when exact product names differ; prefer geometry and functional affordance similarity."
+        parts.append(user_text.strip())
+    if file_context:
+        parts.append("Uploaded notes/specs:\n" + file_context[:30000])
+
+    tag_parts = [
+        "flat",
+        "elongated",
+        "compact",
+        "roundish",
+        "open",
+        "watertight",
+        "holes",
+        "base",
+        "shaft",
+        "ring",
+        "shell",
+        "bracket",
+        "handle",
+        "connector",
+        "mechanical",
+    ]
+    tag_parts.extend(inferred_terms)
+    parts.append("\nGeometry tags:\n" + ", ".join(dict.fromkeys(tag_parts)))
+
+    search_phrases = []
+    if inferred_terms:
+        search_phrases.extend(inferred_terms)
+    if user_text:
+        search_phrases.append(user_text.strip())
+    search_phrases.extend(
+        [
+            "similar 3D geometry",
+            "similar mechanical affordances",
+            "similar shape proportions",
+        ]
     )
+    parts.append("\nSearch phrases:\n" + "\n".join(search_phrases[:10]))
     return "\n\n".join(parts)
 
 
@@ -1016,11 +1079,14 @@ def main():
         layout="wide",
     )
     st.title("3D Mesh Similarity Search")
-    st.caption(f"STL directory: {DATA_DIR} | STEP directory: {STEP_DATA_DIR}")
+    st.caption(
+        f"STL directory: {DATA_DIR} | DeepSeek STL directory: {DEEPSEEK_DATA_DIR} | "
+        f"STEP directory: {STEP_DATA_DIR}"
+    )
     with st.expander("Quick start", expanded=True):
         st.markdown(
             """
-            1. Put your `.stl` files inside `data/`, or `.step` / `.stp` files inside `step_data/`.
+            1. Put normal `.stl` files inside `data/`, DeepSeek `.stl` files inside `deepseek_data/`, or `.step` / `.stp` files inside `step_data/`.
             2. Choose an embedding backend in the sidebar.
             3. Build the index once, then run searches.
             """
@@ -1042,20 +1108,16 @@ def main():
         INDEX_DIR, backend, data_paths
     )
 
-    if getattr(backend, "name", "") == "hybrid" and st.sidebar.button(
-        "Build all local method indexes"
-    ):
-        with st.spinner("Building all local method indexes..."):
-            meta = _build_all_local_method_indexes_with_progress(backend, data_paths)
-        embeddings, stored_paths, meta, stale, mean, std = load_index(
-            INDEX_DIR, backend, data_paths
-        )
-
     if stale:
         st.sidebar.warning("Index missing or out of date.")
-        if st.sidebar.button("Build / Rebuild index"):
+        st.sidebar.caption("Builds only the currently selected backend.")
+        if st.sidebar.button("Build / Rebuild selected index"):
             with st.spinner("Building index..."):
-                meta = _build_index_with_progress(backend, data_paths)
+                try:
+                    meta = _build_index_with_progress(backend, data_paths)
+                except Exception as exc:
+                    st.error(f"Failed to build index: {exc}")
+                    return
             embeddings, stored_paths, meta, stale, mean, std = load_index(
                 INDEX_DIR, backend, data_paths
             )
@@ -1073,7 +1135,7 @@ def main():
 
     st.subheader("Search")
     st.markdown(
-        "Choose a query file, upload a new part, or use the RAG product agent to search from text/files."
+        "Choose a query file, upload a new part, or describe the model you want to find."
     )
     show_3d = st.checkbox("Show 3D previews", value=False)
     if show_3d and go is None:
@@ -1081,7 +1143,8 @@ def main():
         show_3d = False
     viewer_settings = _viewer_settings() if show_3d else None
     upload_mode = "Upload STEP/STP" if hasattr(backend, "embed_path") else "Upload STL"
-    query_modes = ["Choose from dataset", upload_mode, "RAG product agent"]
+    text_query_mode = "Describe model"
+    query_modes = ["Choose from dataset", upload_mode, text_query_mode]
     query_mode = st.radio("Query type", query_modes)
     query_mesh = None
     query_path = None
@@ -1195,10 +1258,10 @@ def main():
     else:
         if not hasattr(backend, "embed_text"):
             st.warning(
-                "The RAG product agent needs a text-capable backend. Use DeepSeek, BERT, BRepMAE, or CADGCL, "
+                "Text description search needs a text-capable backend. Use DeepSeek, BERT, BRepMAE, or CADGCL, "
                 "then build the index for that backend."
             )
-        st.markdown("Upload product notes/specs and ask for the kind of item you want to find.")
+        st.markdown("Describe the model or upload product notes/specs to search by text.")
         rag_files = st.file_uploader(
             "Upload product file",
             type=["txt", "md", "csv", "json", "log"],
@@ -1206,7 +1269,7 @@ def main():
         )
         uploaded_text = _read_uploaded_text(rag_files)
         text_query = st.text_area(
-            "Describe the product or ask the agent",
+            "Describe the model",
             placeholder=(
                 "Example: Find a compact mounting bracket with a flat base, two screw holes, "
                 "and a raised cylindrical support."
@@ -1216,6 +1279,11 @@ def main():
         if uploaded_text:
             with st.expander("Uploaded text preview"):
                 st.text(uploaded_text[:5000])
+        with st.expander("Description prompt for another model"):
+            st.code(MODEL_DESCRIPTION_PROMPT, language="text")
+        if text_query.strip() or uploaded_text:
+            with st.expander("Generated search text"):
+                st.code(_build_rag_query(text_query, uploaded_text), language="text")
 
     top_k = None
     if query_mode == upload_mode:
@@ -1226,12 +1294,12 @@ def main():
     run = st.button("Search")
 
     if run:
-        if query_mode == "RAG product agent":
+        if query_mode == text_query_mode:
             if not hasattr(backend, "embed_text"):
-                st.error("Switch to DeepSeek or BERT to search from text/files.")
+                st.error("Switch to DeepSeek, BERT, BRepMAE, or CADGCL to search from text/files.")
                 return
             if not text_query.strip() and not uploaded_text:
-                st.error("Describe the product or upload a product file first.")
+                st.error("Describe the model or upload a product file first.")
                 return
             with st.spinner("Reading context, embedding text query, and searching..."):
                 rag_query = _build_rag_query(text_query, uploaded_text)

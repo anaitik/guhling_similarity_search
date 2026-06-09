@@ -38,7 +38,16 @@ def _write_index_files(
     extra_meta: Optional[Dict[str, object]] = None,
 ) -> Dict[str, object]:
     if not embeddings:
-        raise RuntimeError("No embeddings were created. Check data and dependencies.")
+        details = "; ".join(
+            f"{Path(str(error.get('path', 'unknown'))).name}: {error.get('error', 'unknown error')}"
+            for error in errors[:3]
+        )
+        message = "No embeddings were created."
+        if details:
+            message += f" First errors: {details}"
+        else:
+            message += " Check data and dependencies."
+        raise RuntimeError(message)
 
     files = _index_files(index_dir, backend.name)
     embeddings_arr = np.vstack(embeddings).astype(np.float32)
@@ -83,8 +92,9 @@ def _path_context(path: Path) -> str:
     if meta.get("value"):
         parts.append(f"value {meta['value']}")
 
+    skipped_folder_names = {"data", "deepseek_data", "step_data"}
     for item in [path.parent.name, path.stem]:
-        if item == path.anchor or item.lower() == "data":
+        if item == path.anchor or item.lower() in skipped_folder_names:
             continue
         cleaned = (
             item.replace("_", " ")

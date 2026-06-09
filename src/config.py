@@ -5,6 +5,7 @@ from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 DATA_DIR = BASE_DIR / "data"
+DEEPSEEK_DATA_DIR = BASE_DIR / "deepseek_data"
 STEP_DATA_DIR = BASE_DIR / "step_data"
 INDEX_DIR = BASE_DIR / "index"
 
