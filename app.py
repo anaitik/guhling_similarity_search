@@ -837,7 +837,7 @@ def _build_index_with_progress(backend, mesh_paths: List[Path]):
 
     def _cb(i: int, total: int):
         progress.progress(min(i / total, 1.0))
-        status.text(f"Indexing {i}/{total}")
+        status.text(f"Indexing missing files {i}/{total}")
 
     meta = None
     if getattr(backend, "name", "") == "hybrid":

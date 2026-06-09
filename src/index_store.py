@@ -145,13 +145,25 @@ def load_index(
     }
     missing_paths = current_set - stored_set
     new_paths = missing_paths - error_paths
+
+    embeddings = np.load(files["embeddings"])
+    if embeddings.shape[0] != len(stored_paths):
+        return None, None, {"status": "index_shape_mismatch", "meta": meta}, True, None, None
+
     if new_paths:
-        return None, None, {"status": "paths_mismatch", "meta": meta}, True, None, None
+        mean = None
+        std = None
+        if files["mean"].exists() and files["std"].exists():
+            mean = np.load(files["mean"])
+            std = np.load(files["std"])
+        partial_meta = dict(meta)
+        partial_meta["status"] = "partial"
+        partial_meta["missing_count"] = len(new_paths)
+        return embeddings, stored_paths, partial_meta, True, mean, std
 
     if not files["mean"].exists() or not files["std"].exists():
         return None, None, {"status": "stats_missing", "meta": meta}, True, None, None
 
-    embeddings = np.load(files["embeddings"])
     mean = np.load(files["mean"])
     std = np.load(files["std"])
     return embeddings, stored_paths, meta, False, mean, std
@@ -165,12 +177,39 @@ def build_index(
 ) -> Dict[str, object]:
     index_dir.mkdir(parents=True, exist_ok=True)
 
-    embeddings: List[np.ndarray] = []
-    stored_paths: List[str] = []
-    errors: List[Dict[str, str]] = []
+    existing_embeddings, existing_paths, existing_meta, _, _, _ = load_index(
+        index_dir, backend, data_paths
+    )
+    if existing_embeddings is not None and existing_paths is not None:
+        embeddings: List[np.ndarray] = [row for row in existing_embeddings]
+        stored_paths: List[str] = list(existing_paths)
+        errors: List[Dict[str, str]] = [
+            error
+            for error in existing_meta.get("errors", [])
+            if isinstance(error, dict)
+        ]
+    else:
+        embeddings = []
+        stored_paths = []
+        errors = []
 
-    total = len(data_paths)
-    for i, path in enumerate(data_paths, start=1):
+    stored_set = set(stored_paths)
+    error_paths = {
+        str(error.get("path"))
+        for error in errors
+        if isinstance(error, dict) and error.get("path")
+    }
+    paths_to_embed = [
+        path
+        for path in data_paths
+        if str(path) not in stored_set and str(path) not in error_paths
+    ]
+
+    if not paths_to_embed and embeddings:
+        return _write_index_files(index_dir, backend, embeddings, stored_paths, errors)
+
+    total = len(paths_to_embed)
+    for i, path in enumerate(paths_to_embed, start=1):
         try:
             if hasattr(backend, "embed_path"):
                 emb = backend.embed_path(path)
