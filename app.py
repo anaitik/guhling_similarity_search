@@ -913,6 +913,75 @@ def _read_uploaded_text(files) -> str:
     return "\n\n".join(chunks)
 
 
+def _render_stl_viewer():
+    st.subheader("STL Viewer")
+    viewer_paths = list_mesh_files(DATA_DIR)
+    deepseek_paths = list_mesh_files(DEEPSEEK_DATA_DIR)
+    all_paths = [(DATA_DIR, path) for path in viewer_paths] + [
+        (DEEPSEEK_DATA_DIR, path) for path in deepseek_paths
+    ]
+    source = st.radio(
+        "Viewer source",
+        ["Choose from project", "Upload STL"],
+        horizontal=True,
+        key="stl_viewer_source",
+    )
+    viewer_settings = _viewer_settings() if go is not None else None
+    if go is None:
+        st.warning("Interactive 3D viewer requires Plotly. Install with `pip install plotly`.")
+
+    mesh = None
+    title = ""
+    if source == "Choose from project":
+        if not all_paths:
+            st.info("No STL files found in data/ or deepseek_data/.")
+            return
+        options = [str(path.relative_to(root)) for root, path in all_paths]
+        selection = st.selectbox(
+            "Select STL",
+            range(len(all_paths)),
+            format_func=lambda idx: f"{all_paths[idx][0].name}/"
+            f"{options[idx]}",
+            key="stl_viewer_selection",
+        )
+        root, path = all_paths[selection]
+        title = f"{root.name}/{path.relative_to(root)}"
+        try:
+            mesh = load_mesh(path)
+        except Exception as exc:
+            st.error(f"Failed to load STL: {exc}")
+            return
+    else:
+        upload = st.file_uploader(
+            "Upload STL to view",
+            type=["stl"],
+            key="stl_viewer_upload",
+        )
+        if upload is None:
+            return
+        title = upload.name
+        try:
+            mesh = load_mesh_from_bytes(upload.getvalue())
+        except Exception as exc:
+            st.error(f"Failed to load uploaded STL: {exc}")
+            return
+
+    if mesh is None:
+        return
+
+    extents = mesh.bounding_box.extents.astype(float)
+    cols = st.columns(4)
+    cols[0].metric("Vertices", f"{len(mesh.vertices):,}")
+    cols[1].metric("Faces", f"{len(mesh.faces):,}")
+    cols[2].metric("Watertight", "Yes" if mesh.is_watertight else "No")
+    cols[3].metric("Extents", f"{extents[0]:.2f} x {extents[1]:.2f} x {extents[2]:.2f}")
+
+    if go is not None:
+        _render_3d(mesh, title, viewer_settings)
+    else:
+        _render_preview(mesh, title)
+
+
 def _build_rag_query(user_text: str, file_context: str) -> str:
     combined = f"{user_text}\n{file_context}".lower()
     vocabulary = {
@@ -1094,6 +1163,9 @@ def main():
 
     backend, search_settings, distance_metric = _make_backend()
     data_paths, rel_paths, active_data_dir, active_file_label = _load_data_list(backend)
+
+    with st.expander("STL Viewer", expanded=False):
+        _render_stl_viewer()
 
     if not data_paths:
         st.error(f"No `{active_file_label}` files found in {active_data_dir}.")
