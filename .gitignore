@@ -42,7 +42,7 @@ build/
 .eggs/
 
 # Local data and cached indexes
-data/
+# data/
 index/
 .cache/
 step-data/
